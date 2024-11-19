@@ -11,6 +11,7 @@
 
 #include "model_adapter.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
 
 #include <chrono>
 
@@ -313,6 +314,10 @@ void print_tok_vec(std::vector<float> &embd)
             else if(modelarch=="qwen2")
             {
                 fileformatmeta->model_architecture = GGUFArch::ARCH_QWEN2;
+            }
+            else if(modelarch=="rwkv6")
+            {
+                fileformatmeta->model_architecture = GGUFArch::ARCH_RWKV;
             }
             printf("Arch Category: %d\n",fileformatmeta->model_architecture);
 

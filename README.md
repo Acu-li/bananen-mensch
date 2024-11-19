@@ -11,21 +11,26 @@ KoboldCpp is an easy-to-use AI text-generation software for GGML and GGUF models
 - Windows binaries are provided in the form of **koboldcpp.exe**, which is a pyinstaller wrapper containing all necessary files. **[Download the latest koboldcpp.exe release here](https://github.com/LostRuins/koboldcpp/releases/latest)**
 - To run, simply execute **koboldcpp.exe**.
 - Launching with no command line arguments displays a GUI containing a subset of configurable settings. Generally you dont have to change much besides the `Presets` and `GPU Layers`. Read the `--help` for more info about each settings.
+- Obtain and load a GGUF model. See [here](#Obtaining-a-GGUF-model)
 - By default, you can connect to http://localhost:5001
 - You can also run it using the command line. For info, please check `koboldcpp.exe --help`
 
 ## Linux Usage (Precompiled Binary, Recommended)
-On modern Linux systems, you should download the `koboldcpp-linux-x64-cuda1150` prebuilt PyInstaller binary on the **[releases page](https://github.com/LostRuins/koboldcpp/releases/latest)**. Simply download and run the binary.
+On modern Linux systems, you should download the `koboldcpp-linux-x64-cuda1150` prebuilt PyInstaller binary on the **[releases page](https://github.com/LostRuins/koboldcpp/releases/latest)**. Simply download and run the binary (You may have to `chmod +x` it first).
 
 Alternatively, you can also install koboldcpp to the current directory by running the following terminal command:
 ```
 curl -fLo koboldcpp https://github.com/LostRuins/koboldcpp/releases/latest/download/koboldcpp-linux-x64-cuda1150 && chmod +x koboldcpp
 ```
 After running this command you can launch Koboldcpp from the current directory using `./koboldcpp` in the terminal (for CLI usage, run with `--help`).
+Finally, obtain and load a GGUF model. See [here](#Obtaining-a-GGUF-model)
 
 ## MacOS (Precompiled Binary)
-- PyInstaller binaries for Modern ARM64 MacOS (M1, M2, M3) are now available! **[Simply download and run the MacOS binary](https://github.com/LostRuins/koboldcpp/releases/latest)**
+- PyInstaller binaries for Modern ARM64 MacOS (M1, M2, M3) are now available! **[Simply download the MacOS binary](https://github.com/LostRuins/koboldcpp/releases/latest)**
+- In a MacOS terminal window, set the file to executable `chmod +x koboldcpp-mac-arm64` and run it with `./koboldcpp-mac-arm64`.
+- In newer MacOS you may also have to whitelist it in security settings if it's blocked. [Here's a video guide](https://youtube.com/watch?v=NOW5dyA_JgY).
 - Alternatively, or for older x86 MacOS computers, you can clone the repo and compile from source code, see Compiling for MacOS below.
+- Finally, obtain and load a GGUF model. See [here](#Obtaining-a-GGUF-model)
 
 ## Run on Colab
 - KoboldCpp now has an **official Colab GPU Notebook**! This is an easy way to get started without installing anything in a minute or two. [Try it here!](https://colab.research.google.com/github/LostRuins/koboldcpp/blob/concedo/colab.ipynb).
@@ -34,20 +39,24 @@ After running this command you can launch Koboldcpp from the current directory u
 ## Run on RunPod
 - KoboldCpp can now be used on RunPod cloud GPUs! This is an easy way to get started without installing anything in a minute or two, and is very scalable, capable of running 70B+ models at afforable cost. [Try our RunPod image here!](https://koboldai.org/runpodcpp).
 
+## Run on Novita AI
+KoboldCpp can now also be run on Novita AI, a newer alternative GPU cloud provider which has a quick launch KoboldCpp template for as well. [Check it out here!](https://koboldai.org/novitacpp)
+
 ## Docker
 - The official docker can be found at https://hub.docker.com/r/koboldai/koboldcpp
 - If you're building your own docker, remember to set CUDA_DOCKER_ARCH or enable LLAMA_PORTABLE
 
 ## Obtaining a GGUF model
-- KoboldCpp uses GGUF models. They are not included here, but you can download GGUF files from other places such as [TheBloke's Huggingface](https://huggingface.co/TheBloke). Search for "GGUF" on huggingface.co for plenty of compatible models in the `.gguf` format.
+- KoboldCpp uses GGUF models. They are not included with KoboldCpp, but you can download GGUF files from other places such as [TheBloke's Huggingface](https://huggingface.co/TheBloke). Search for "GGUF" on huggingface.co for plenty of compatible models in the `.gguf` format.
 - For beginners, we recommend the models [Airoboros Mistral](https://huggingface.co/TheBloke/airoboros-mistral2.2-7B-GGUF/resolve/main/airoboros-mistral2.2-7b.Q4_K_S.gguf) or [Tiefighter 13B](https://huggingface.co/KoboldAI/LLaMA2-13B-Tiefighter-GGUF/resolve/main/LLaMA2-13B-Tiefighter.Q4_K_S.gguf) (larger model).
 - [Alternatively, you can download the tools to convert models to the GGUF format yourself here](https://kcpptools.concedo.workers.dev). Run `convert-hf-to-gguf.py` to convert them, then `quantize_gguf.exe` to quantize the result.
+- Other models for Whisper (speech recognition), Image Generation or Image Recognition [can be found on the Wiki](https://github.com/LostRuins/koboldcpp/wiki#what-models-does-koboldcpp-support-what-architectures-are-supported)
 
 ## Improving Performance
 - **GPU Acceleration**: If you're on Windows with an Nvidia GPU you can get CUDA support out of the box using the `--usecublas`  flag (Nvidia Only), or `--usevulkan` (Any GPU), make sure you select the correct .exe with CUDA support.
 - **GPU Layer Offloading**: Add `--gpulayers` to offload model layers to the GPU. The more layers you offload to VRAM, the faster generation speed will become. Experiment to determine number of layers to offload, and reduce by a few if you run out of memory.
 - **Increasing Context Size**: Use `--contextsize (number)` to increase context size, allowing the model to read more text. Note that you may also need to increase the max context in the KoboldAI Lite UI as well (click and edit the number text field).
-- **Old CPU Compatibility**: If you are having crashes or issues, you can try turning off BLAS with the `--noblas` flag. You can also try running in a non-avx2 compatibility mode with `--noavx2`. Lastly, you can try turning off mmap with `--nommap`.
+- **Old CPU Compatibility**: If you are having crashes or issues, you can try running in a non-avx2 compatibility mode by adding the `--noavx2` flag. You can also try turning off mmap with `--nommap` or reducing your `--blasbatchssize` (set -1 to avoid batching)
 
 For more information, be sure to run the program with the `--help` flag, or **[check the wiki](https://github.com/LostRuins/koboldcpp/wiki).**
 
@@ -67,13 +76,13 @@ when you can't use the precompiled binary directly, we provide an automated buil
 ### Compiling on Linux (Manual Method)
 - To compile your binaries from source, clone the repo with `git clone https://github.com/LostRuins/koboldcpp.git`
 - A makefile is provided, simply run `make`.
-- Optional OpenBLAS: Link your own install of OpenBLAS manually with `make LLAMA_OPENBLAS=1`
+- Optional Vulkan: Link your own install of Vulkan SDK manually with `make LLAMA_VULKAN=1`
 - Optional CLBlast: Link your own install of CLBlast manually with `make LLAMA_CLBLAST=1`
 - Note: for these you will need to obtain and link OpenCL and CLBlast libraries.
-  - For Arch Linux: Install `cblas` `openblas` and `clblast`.
-  - For Debian: Install `libclblast-dev` and `libopenblas-dev`.
+  - For Arch Linux: Install `cblas` and `clblast`.
+  - For Debian: Install `libclblast-dev`.
 - You can attempt a CuBLAS build with `LLAMA_CUBLAS=1`, (or `LLAMA_HIPBLAS=1` for AMD). You will need CUDA Toolkit installed. Some have also reported success with the CMake file, though that is more for windows.
-- For a full featured build (all backends), do `make LLAMA_OPENBLAS=1 LLAMA_CLBLAST=1 LLAMA_CUBLAS=1 LLAMA_VULKAN=1`. (Note that `LLAMA_CUBLAS=1` will not work on windows, you need visual studio)
+- For a full featured build (all backends), do `make LLAMA_CLBLAST=1 LLAMA_CUBLAS=1 LLAMA_VULKAN=1`. (Note that `LLAMA_CUBLAS=1` will not work on windows, you need visual studio)
 - After all binaries are built, you can run the python script with the command `koboldcpp.py [ggml_model.gguf] [port]`
 
 ### Compiling on Windows
@@ -84,12 +93,11 @@ when you can't use the precompiled binary directly, we provide an automated buil
   - If you want to generate the .exe file, make sure you have the python module PyInstaller installed with pip (`pip install PyInstaller`). Then run the script `make_pyinstaller.bat`
   - The koboldcpp.exe file will be at your dist folder.
 - **Building with CUDA**: Visual Studio, CMake and CUDA Toolkit is required. Clone the repo, then open the CMake file and compile it in Visual Studio. Copy the `koboldcpp_cublas.dll` generated into the same directory as the `koboldcpp.py` file. If you are bundling executables, you may need to include CUDA dynamic libraries (such as `cublasLt64_11.dll` and `cublas64_11.dll`) in order for the executable to work correctly on a different PC.
-- **Replacing Libraries (Not Recommended)**: If you wish to use your own version of the additional Windows libraries (OpenCL, CLBlast and OpenBLAS), you can do it with:
+- **Replacing Libraries (Not Recommended)**: If you wish to use your own version of the additional Windows libraries (OpenCL, CLBlast, Vulkan), you can do it with:
   - OpenCL - tested with https://github.com/KhronosGroup/OpenCL-SDK . If you wish to compile it, follow the repository instructions. You will need vcpkg.
   - CLBlast - tested with https://github.com/CNugteren/CLBlast . If you wish to compile it you will need to reference the OpenCL files. It will only generate the ".lib" file if you compile using MSVC.
-  - OpenBLAS - tested with https://github.com/xianyi/OpenBLAS .
   - Move the respectives .lib files to the /lib folder of your project, overwriting the older files.
-  - Also, replace the existing versions of the corresponding .dll files located in the project directory root (e.g. libopenblas.dll).
+  - Also, replace the existing versions of the corresponding .dll files located in the project directory root (e.g. clblast.dll).
   - Make the KoboldCpp project using the instructions above.
 
 ### Compiling on MacOS
@@ -113,7 +121,8 @@ when you can't use the precompiled binary directly, we provide an automated buil
 - GPU acceleration for Termux may be possible but I have not explored it. If you find a good cross-device solution, do share or PR it.
 
 ## AMD Users
-- Please check out https://github.com/YellowRoseCx/koboldcpp-rocm
+- For most users, you can get very decent speeds by selecting the **Vulkan** option instead, which supports both Nvidia and AMD GPUs.
+- Alternatively, you can try the ROCM fork at https://github.com/YellowRoseCx/koboldcpp-rocm
 
 ## Third Party Resources
 - These unofficial resources have been contributed by the community, and may be outdated or unmaintained. No official support will be provided for them!
@@ -124,7 +133,7 @@ when you can't use the precompiled binary directly, we provide an automated buil
     - Metal is enabled by default on macOS, Vulkan support is enabled by default on both Linux and macOS, ROCm support isn't available yet.
     - You can also use `nix3-run` to use KoboldCpp: `nix run --expr ``with import <nixpkgs> { config = { allowUnfree = true; cudaSupport = true; }; }; koboldcpp`` --impure`
     - Or use `nix-shell`: `nix-shell --expr 'with import <nixpkgs> { config = { allowUnfree = true; cudaSupport = true; }; }; koboldcpp' --run "koboldcpp" --impure`
-    - Packages (like OpenBlast, CLBLast, Vulkan, etc.) can be overridden, please refer to the [17th Nix Pill - Nixpkgs Overriding Packages](https://nixos.org/guides/nix-pills/17-nixpkgs-overriding-packages)
+    - Packages (like CLBLast, Vulkan, etc.) can be overridden, please refer to the [17th Nix Pill - Nixpkgs Overriding Packages](https://nixos.org/guides/nix-pills/17-nixpkgs-overriding-packages)
 
 ## Questions and Help Wiki
 - **First, please check out [The KoboldCpp FAQ and Knowledgebase](https://github.com/LostRuins/koboldcpp/wiki) which may already have answers to your questions! Also please search through past issues and discussions.**
@@ -138,13 +147,13 @@ when you can't use the precompiled binary directly, we provide an automated buil
 
 ## Considerations
 - For Windows: No installation, single file executable, (It Just Works)
-- Since v1.0.6, requires libopenblas, the prebuilt windows binaries are included in this repo. If not found, it will fall back to a mode without BLAS.
 - Since v1.15, requires CLBlast if enabled, the prebuilt windows binaries are included in this repo. If not found, it will fall back to a mode without CLBlast.
 - Since v1.33, you can set the context size to be above what the model supports officially. It does increases perplexity but should still work well below 4096 even on untuned models. (For GPT-NeoX, GPT-J, and Llama models) Customize this with `--ropeconfig`.
 - Since v1.42, supports GGUF models for LLAMA and Falcon
 - Since v1.55, lcuda paths on Linux are hardcoded and may require manual changes to the makefile if you do not use koboldcpp.sh for the compilation.
 - Since v1.60, provides native image generation with StableDiffusion.cpp, you can load any SD1.5 or SDXL .safetensors model and it will provide an A1111 compatible API to use.
 - **I try to keep backwards compatibility with ALL past llama.cpp models**. But you are also encouraged to reconvert/update your models if possible for best results.
+- Since v1.75, openblas has been deprecated and removed in favor of the native CPU implementation.
 
 ## License
 - The original GGML library and llama.cpp by ggerganov are licensed under the MIT License

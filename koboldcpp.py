@@ -15,17 +15,21 @@ import platform
 import base64
 import json, sys, http.server, time, asyncio, socket, threading
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 # constants
 sampler_order_max = 7
-stop_token_max = 24
-ban_token_max = 16
 tensor_split_max = 16
-logit_bias_max = 24
-dry_seq_break_max = 24
 images_max = 4
 bias_min_value = -100.0
 bias_max_value = 100.0
+logprobs_max = 5
+
+# abuse prevention
+stop_token_max = 256
+ban_token_max = 512
+logit_bias_max = 512
+dry_seq_break_max = 128
 
 # global vars
 handle = None
@@ -41,7 +45,7 @@ maxhordelen = 400
 modelbusy = threading.Lock()
 requestsinqueue = 0
 defaultport = 5001
-KcppVersion = "1.73.1"
+KcppVersion = "1.78"
 showdebug = True
 guimode = False
 showsamplerwarning = True
@@ -98,6 +102,17 @@ class token_count_outputs(ctypes.Structure):
     _fields_ = [("count", ctypes.c_int),
                 ("ids", ctypes.POINTER(ctypes.c_int))]
 
+# returns top 5 logprobs per token
+class logprob_item(ctypes.Structure):
+     _fields_ = [("option_count", ctypes.c_int),
+                ("selected_token", ctypes.c_char_p),
+                ("selected_logprob", ctypes.c_float),
+                ("tokens", ctypes.c_char_p * logprobs_max),
+                ("logprobs", ctypes.POINTER(ctypes.c_float))]
+class last_logprobs_outputs(ctypes.Structure):
+    _fields_ = [("count", ctypes.c_int),
+                ("logprob_items", ctypes.POINTER(logprob_item))]
+
 class load_model_inputs(ctypes.Structure):
     _fields_ = [("threads", ctypes.c_int),
                 ("blasthreads", ctypes.c_int),
@@ -114,6 +129,7 @@ class load_model_inputs(ctypes.Structure):
                 ("use_mlock", ctypes.c_bool),
                 ("use_smartcontext", ctypes.c_bool),
                 ("use_contextshift", ctypes.c_bool),
+                ("use_fastforward", ctypes.c_bool),
                 ("clblast_info", ctypes.c_int),
                 ("cublas_info", ctypes.c_int),
                 ("vulkan_info", ctypes.c_char_p),
@@ -149,17 +165,13 @@ class generation_inputs(ctypes.Structure):
                 ("mirostat", ctypes.c_int),
                 ("mirostat_tau", ctypes.c_float),
                 ("mirostat_eta", ctypes.c_float),
-                ("dry_multiplier", ctypes.c_float),
-                ("dry_base", ctypes.c_float),
-                ("dry_allowed_length", ctypes.c_int),
-                ("dry_penalty_last_n", ctypes.c_int),
-                ("dry_sequence_breakers", ctypes.c_char_p * dry_seq_break_max),
+                ("xtc_threshold", ctypes.c_float),
+                ("xtc_probability", ctypes.c_float),
                 ("sampler_order", ctypes.c_int * sampler_order_max),
                 ("sampler_len", ctypes.c_int),
                 ("allow_eos_token", ctypes.c_bool),
                 ("bypass_eos_token", ctypes.c_bool),
                 ("render_special", ctypes.c_bool),
-                ("stop_sequence", ctypes.c_char_p * stop_token_max),
                 ("stream_sse", ctypes.c_bool),
                 ("grammar", ctypes.c_char_p),
                 ("grammar_retain_state", ctypes.c_bool),
@@ -167,12 +179,24 @@ class generation_inputs(ctypes.Structure):
                 ("dynatemp_range", ctypes.c_float),
                 ("dynatemp_exponent", ctypes.c_float),
                 ("smoothing_factor", ctypes.c_float),
-                ("logit_biases", logit_bias * logit_bias_max),
-                ("banned_tokens", ctypes.c_char_p * ban_token_max)]
+                ("dry_multiplier", ctypes.c_float),
+                ("dry_base", ctypes.c_float),
+                ("dry_allowed_length", ctypes.c_int),
+                ("dry_penalty_last_n", ctypes.c_int),
+                ("dry_sequence_breakers_len", ctypes.c_int),
+                ("dry_sequence_breakers", ctypes.POINTER(ctypes.c_char_p)),
+                ("stop_sequence_len", ctypes.c_int),
+                ("stop_sequence", ctypes.POINTER(ctypes.c_char_p)),
+                ("logit_biases_len", ctypes.c_int),
+                ("logit_biases", ctypes.POINTER(logit_bias)),
+                ("banned_tokens_len", ctypes.c_int),
+                ("banned_tokens", ctypes.POINTER(ctypes.c_char_p))]
 
 class generation_outputs(ctypes.Structure):
     _fields_ = [("status", ctypes.c_int),
                 ("stopreason", ctypes.c_int),
+                ("prompt_tokens", ctypes.c_int),
+                ("completion_tokens", ctypes.c_int),
                 ("text", ctypes.c_char_p)]
 
 class sd_load_model_inputs(ctypes.Structure):
@@ -184,6 +208,9 @@ class sd_load_model_inputs(ctypes.Structure):
                 ("threads", ctypes.c_int),
                 ("quant", ctypes.c_int),
                 ("taesd", ctypes.c_bool),
+                ("t5xxl_filename", ctypes.c_char_p),
+                ("clipl_filename", ctypes.c_char_p),
+                ("clipg_filename", ctypes.c_char_p),
                 ("vae_filename", ctypes.c_char_p),
                 ("lora_filename", ctypes.c_char_p),
                 ("lora_multiplier", ctypes.c_float),
@@ -290,7 +317,6 @@ def pick_existant_file(ntoption,nonntoption):
 
 lib_default = pick_existant_file("koboldcpp_default.dll","koboldcpp_default.so")
 lib_failsafe = pick_existant_file("koboldcpp_failsafe.dll","koboldcpp_failsafe.so")
-lib_openblas = pick_existant_file("koboldcpp_openblas.dll","koboldcpp_openblas.so")
 lib_noavx2 = pick_existant_file("koboldcpp_noavx2.dll","koboldcpp_noavx2.so")
 lib_clblast = pick_existant_file("koboldcpp_clblast.dll","koboldcpp_clblast.so")
 lib_clblast_noavx2 = pick_existant_file("koboldcpp_clblast_noavx2.dll","koboldcpp_clblast_noavx2.so")
@@ -300,25 +326,23 @@ lib_vulkan = pick_existant_file("koboldcpp_vulkan.dll","koboldcpp_vulkan.so")
 lib_vulkan_noavx2 = pick_existant_file("koboldcpp_vulkan_noavx2.dll","koboldcpp_vulkan_noavx2.so")
 libname = ""
 lib_option_pairs = [
-    (lib_openblas, "Use OpenBLAS"),
-    (lib_default, "Use No BLAS"),
+    (lib_default, "Use CPU"),
     (lib_clblast, "Use CLBlast"),
     (lib_cublas, "Use CuBLAS"),
     (lib_hipblas, "Use hipBLAS (ROCm)"),
     (lib_vulkan, "Use Vulkan"),
-    (lib_noavx2, "NoAVX2 Mode (Old CPU)"),
-    (lib_clblast_noavx2, "CLBlast NoAVX2 (Old CPU)"),
-    (lib_vulkan_noavx2, "Vulkan NoAVX2 (Old CPU)"),
+    (lib_noavx2, "Use CPU (Old CPU)"),
+    (lib_clblast_noavx2, "Use CLBlast (Old CPU)"),
+    (lib_vulkan_noavx2, "Use Vulkan (Old CPU)"),
     (lib_failsafe, "Failsafe Mode (Old CPU)")]
-openblas_option, default_option, clblast_option, cublas_option, hipblas_option, vulkan_option, noavx2_option, clblast_noavx2_option, vulkan_noavx2_option, failsafe_option = (opt if file_exists(lib) or (os.name == 'nt' and file_exists(opt + ".dll")) else None for lib, opt in lib_option_pairs)
+default_option, clblast_option, cublas_option, hipblas_option, vulkan_option, noavx2_option, clblast_noavx2_option, vulkan_noavx2_option, failsafe_option = (opt if file_exists(lib) or (os.name == 'nt' and file_exists(opt + ".dll")) else None for lib, opt in lib_option_pairs)
 runopts = [opt for lib, opt in lib_option_pairs if file_exists(lib)]
 
 def init_library():
     global handle, args, libname
-    global lib_default,lib_failsafe,lib_openblas,lib_noavx2,lib_clblast,lib_clblast_noavx2,lib_cublas,lib_hipblas,lib_vulkan,lib_vulkan_noavx2
+    global lib_default,lib_failsafe,lib_noavx2,lib_clblast,lib_clblast_noavx2,lib_cublas,lib_hipblas,lib_vulkan,lib_vulkan_noavx2
 
     libname = ""
-    use_openblas = False # if true, uses OpenBLAS for acceleration. libopenblas.dll must exist in the same dir.
     use_clblast = False #uses CLBlast instead
     use_cublas = False #uses cublas instead
     use_hipblas = False #uses hipblas instead
@@ -330,27 +354,27 @@ def init_library():
         use_noavx2 = True
         if args.useclblast:
             if not file_exists(lib_clblast_noavx2) or (os.name=='nt' and not file_exists("clblast.dll")):
-                print("Warning: NoAVX2 CLBlast library file not found. Non-BLAS library will be used.")
+                print("Warning: NoAVX2 CLBlast library file not found. CPU library will be used.")
             else:
                 print("Attempting to use NoAVX2 CLBlast library for faster prompt ingestion. A compatible clblast will be required.")
                 use_clblast = True
         elif (args.usevulkan is not None):
             if not file_exists(lib_vulkan_noavx2):
-                print("Warning: NoAVX2 Vulkan library file not found. Non-BLAS library will be used.")
+                print("Warning: NoAVX2 Vulkan library file not found. CPU library will be used.")
             else:
                 print("Attempting to use NoAVX2 Vulkan library for faster prompt ingestion. A compatible Vulkan will be required.")
                 use_vulkan = True
         else:
             if not file_exists(lib_noavx2):
                 print("Warning: NoAVX2 library file not found. Failsafe library will be used.")
-            elif (args.noblas and args.nommap):
+            elif (args.usecpu and args.nommap):
                 use_failsafe = True
                 print("!!! Attempting to use FAILSAFE MODE !!!")
             else:
                 print("Attempting to use non-avx2 compatibility library.")
     elif (args.usecublas is not None):
         if not file_exists(lib_cublas) and not file_exists(lib_hipblas):
-            print("Warning: CuBLAS library file not found. Non-BLAS library will be used.")
+            print("Warning: CuBLAS library file not found. CPU library will be used.")
         else:
             if file_exists(lib_cublas):
                 print("Attempting to use CuBLAS library for faster prompt ingestion. A compatible CuBLAS will be required.")
@@ -360,26 +384,18 @@ def init_library():
                 use_hipblas = True
     elif (args.usevulkan is not None):
         if not file_exists(lib_vulkan):
-            print("Warning: Vulkan library file not found. Non-BLAS library will be used.")
+            print("Warning: Vulkan library file not found. CPU library will be used.")
         else:
             print("Attempting to use Vulkan library for faster prompt ingestion. A compatible Vulkan will be required.")
             use_vulkan = True
     elif args.useclblast:
         if not file_exists(lib_clblast) or (os.name=='nt' and not file_exists("clblast.dll")):
-            print("Warning: CLBlast library file not found. Non-BLAS library will be used.")
+            print("Warning: CLBlast library file not found. CPU library will be used.")
         else:
             print("Attempting to use CLBlast library for faster prompt ingestion. A compatible clblast will be required.")
             use_clblast = True
     else:
-        if not file_exists(lib_openblas) or (os.name=='nt' and not file_exists("libopenblas.dll")):
-            print("Warning: OpenBLAS library file not found. Non-BLAS library will be used.")
-        elif args.noblas:
-            print("Attempting to library without OpenBLAS.")
-        else:
-            use_openblas = True
-            print("Attempting to use OpenBLAS library for faster prompt ingestion. A compatible libopenblas will be required.")
-            if sys.platform=="darwin":
-                print("Mac OSX note: Some people have found Accelerate actually faster than OpenBLAS. To compare, run Koboldcpp with --noblas instead.")
+        print("Attempting to use CPU library.")
 
     if use_noavx2:
         if use_failsafe:
@@ -397,8 +413,6 @@ def init_library():
             libname = lib_cublas
         elif use_hipblas:
             libname = lib_hipblas
-        elif use_openblas:
-            libname = lib_openblas
         elif use_vulkan:
             libname = lib_vulkan
         else:
@@ -449,6 +463,7 @@ def init_library():
     handle.whisper_load_model.restype = ctypes.c_bool
     handle.whisper_generate.argtypes = [whisper_generation_inputs]
     handle.whisper_generate.restype = whisper_generation_outputs
+    handle.last_logprobs.restype = last_logprobs_outputs
 
 def set_backend_props(inputs):
     clblastids = 0
@@ -591,13 +606,22 @@ def bring_terminal_to_foreground():
         ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 9)
         ctypes.windll.user32.SetForegroundWindow(ctypes.windll.kernel32.GetConsoleWindow())
 
-def string_contains_sequence_substring(inputstr,sequences):
-    if inputstr.strip()=="":
+def string_has_overlap(str_a, str_b, maxcheck):
+    max_overlap = min(maxcheck, len(str_a), len(str_b))
+    for i in range(1, max_overlap + 1):
+        if str_a[-i:] == str_b[:i]:
+            return True
+    return False
+
+def string_contains_or_overlaps_sequence_substring(inputstr, sequences):
+    if inputstr=="":
         return False
     for s in sequences:
         if s.strip()=="":
             continue
         if s.strip() in inputstr.strip() or inputstr.strip() in s.strip():
+            return True
+        if string_has_overlap(inputstr, s, 10):
             return True
     return False
 
@@ -697,7 +721,7 @@ def autoset_gpu_layers(ctxsize,sdquanted,bbs): #shitty algo to determine how man
                 layers = ggufmeta[0]
                 headcount = ggufmeta[1]
                 headkvlen = (ggufmeta[2] if ggufmeta[2] > 0 else 128)
-                ratio = (mem-usedmem)/(fsize*csmul*1.55)
+                ratio = (mem-usedmem)/(fsize*csmul*1.6*(1.0 if bbs <= 512 else 1.2))
                 computemem = layers*(4 if bbs <= 512 else (bbs/128))*headkvlen*cs*4*1.5 # apply blasbatchsize calculations if over 512
                 contextmem = layers*headcount*headkvlen*cs*4*1.1
                 if headcount > 0:
@@ -710,34 +734,6 @@ def autoset_gpu_layers(ctxsize,sdquanted,bbs): #shitty algo to determine how man
 
 def fetch_gpu_properties(testCL,testCU,testVK):
     import subprocess
-    if testCL:
-        try: # Get OpenCL GPU names on windows using a special binary. overwrite at known index if found.
-            basepath = os.path.abspath(os.path.dirname(__file__))
-            output = ""
-            data = None
-            try:
-                output = subprocess.run(["clinfo","--json"], capture_output=True, text=True, check=True, encoding='utf-8').stdout
-                data = json.loads(output)
-            except Exception as e1:
-                output = subprocess.run([((os.path.join(basepath, "winclinfo.exe")) if os.name == 'nt' else "clinfo"),"--json"], capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS, encoding='utf-8').stdout
-                data = json.loads(output)
-            plat = 0
-            dev = 0
-            lowestclmem = 0
-            for platform in data["devices"]:
-                dev = 0
-                for device in platform["online"]:
-                    dname = device["CL_DEVICE_NAME"]
-                    dmem = int(device["CL_DEVICE_GLOBAL_MEM_SIZE"])
-                    idx = plat+dev*2
-                    if idx<len(CLDevices):
-                        CLDevicesNames[idx] = dname
-                        lowestclmem = dmem if lowestclmem==0 else (dmem if dmem<lowestclmem else lowestclmem)
-                    dev += 1
-                plat += 1
-            MaxMemory[0] = lowestclmem
-        except Exception as e:
-            pass
 
     if testCU:
         FetchedCUdevices = []
@@ -801,20 +797,54 @@ def fetch_gpu_properties(testCL,testCU,testVK):
                         idx += 1
         except Exception as e:
             pass
+
+    if testCL:
+        try: # Get OpenCL GPU names on windows using a special binary. overwrite at known index if found.
+            basepath = os.path.abspath(os.path.dirname(__file__))
+            output = ""
+            data = None
+            try:
+                output = subprocess.run(["clinfo","--json"], capture_output=True, text=True, check=True, encoding='utf-8').stdout
+                data = json.loads(output)
+            except Exception as e1:
+                output = subprocess.run([((os.path.join(basepath, "winclinfo.exe")) if os.name == 'nt' else "clinfo"),"--json"], capture_output=True, text=True, check=True, creationflags=subprocess.CREATE_NO_WINDOW | subprocess.DETACHED_PROCESS, encoding='utf-8').stdout
+                data = json.loads(output)
+            plat = 0
+            dev = 0
+            lowestclmem = 0
+            for platform in data["devices"]:
+                dev = 0
+                for device in platform["online"]:
+                    dname = device["CL_DEVICE_NAME"]
+                    dmem = int(device["CL_DEVICE_GLOBAL_MEM_SIZE"])
+                    idx = plat+dev*2
+                    if idx<len(CLDevices):
+                        CLDevicesNames[idx] = dname
+                        lowestclmem = dmem if lowestclmem==0 else (dmem if dmem<lowestclmem else lowestclmem)
+                    dev += 1
+                plat += 1
+            MaxMemory[0] = max(lowestclmem,MaxMemory[0])
+        except Exception as e:
+            pass
     return
 
 def auto_set_backend_cli():
     fetch_gpu_properties(False,True,True)
+    found_new_backend = False
     if exitcounter < 100 and MaxMemory[0]>3500000000 and (("Use CuBLAS" in runopts and CUDevicesNames[0]!="") or "Use hipBLAS (ROCm)" in runopts) and any(CUDevicesNames):
         if "Use CuBLAS" in runopts or "Use hipBLAS (ROCm)" in runopts:
             args.usecublas = ["normal","mmq"]
             print("Auto Selected CUDA Backend...\n")
+            found_new_backend = True
     elif exitcounter < 100 and (1 in VKIsDGPU) and "Use Vulkan" in runopts:
         for i in range(0,len(VKIsDGPU)):
             if VKIsDGPU[i]==1:
                 args.usevulkan = []
                 print("Auto Selected Vulkan Backend...\n")
+                found_new_backend = True
                 break
+    if not found_new_backend:
+        print("No GPU Backend found...\n")
 
 def load_model(model_filename):
     global args
@@ -840,6 +870,7 @@ def load_model(model_filename):
     inputs.mmproj_filename = args.mmproj.encode("UTF-8") if args.mmproj else "".encode("UTF-8")
     inputs.use_smartcontext = args.smartcontext
     inputs.use_contextshift = (0 if args.noshift else 1)
+    inputs.use_fastforward = (0 if args.nofastforward else 1)
     inputs.flash_attention = args.flashattention
     if args.quantkv>0:
         inputs.quant_k = inputs.quant_v = args.quantkv
@@ -876,7 +907,7 @@ def generate(genparams, is_quiet=False, stream_flag=False):
     memory = genparams.get('memory', "")
     images = genparams.get('images', [])
     max_context_length = genparams.get('max_context_length', maxctx)
-    max_length = genparams.get('max_length', 180)
+    max_length = genparams.get('max_length', 200)
     temperature = genparams.get('temperature', 0.7)
     top_k = genparams.get('top_k', 100)
     top_a = genparams.get('top_a', 0.0)
@@ -896,6 +927,8 @@ def generate(genparams, is_quiet=False, stream_flag=False):
     dry_allowed_length = genparams.get('dry_allowed_length', 2)
     dry_penalty_last_n = genparams.get('dry_penalty_last_n', 320)
     dry_sequence_breakers = genparams.get('dry_sequence_breakers', [])
+    xtc_threshold = genparams.get('xtc_threshold', 0.2)
+    xtc_probability = genparams.get('xtc_probability', 0)
     sampler_order = genparams.get('sampler_order', [6, 0, 1, 3, 4, 2, 5])
     seed = tryparseint(genparams.get('sampler_seed', -1))
     stop_sequence = genparams.get('stop_sequence', [])
@@ -911,8 +944,15 @@ def generate(genparams, is_quiet=False, stream_flag=False):
     smoothing_factor = genparams.get('smoothing_factor', 0.0)
     logit_biases = genparams.get('logit_bias', {})
     render_special = genparams.get('render_special', False)
-    banned_tokens = genparams.get('banned_tokens', [])
+    banned_strings = genparams.get('banned_strings', []) # SillyTavern uses that name
+    banned_tokens = genparams.get('banned_tokens', banned_strings)
     bypass_eos_token = genparams.get('bypass_eos', False)
+    custom_token_bans = genparams.get('custom_token_bans', '')
+
+    for tok in custom_token_bans.split(','):
+        tok = tok.strip()  # Remove leading/trailing whitespace
+        if tok.isdigit():
+            logit_biases[tok] = bias_min_value
 
     inputs = generation_inputs()
     inputs.prompt = prompt.encode("UTF-8")
@@ -964,6 +1004,8 @@ def generate(genparams, is_quiet=False, stream_flag=False):
         inputs.mirostat = inputs.mirostat_tau = inputs.mirostat_eta = 0
     inputs.dry_multiplier = dry_multiplier
     inputs.dry_base = dry_base
+    inputs.xtc_threshold = xtc_threshold
+    inputs.xtc_probability = xtc_probability
     inputs.dry_allowed_length = dry_allowed_length
     inputs.dry_penalty_last_n = dry_penalty_last_n
     # Handle dry_sequence_breakers being passed as a json-encoded array of
@@ -975,11 +1017,16 @@ def generate(genparams, is_quiet=False, stream_flag=False):
         except ValueError as e:
             print(f"ERROR: dry_sequence_breakers must be an array of strings or a json encoded array of strings. Could not parse '{dry_sequence_breakers}': " + str(e))
             dry_sequence_breakers = []
-    for n in range(dry_seq_break_max):
-        if dry_multiplier > 0 and n < len(dry_sequence_breakers):
-            inputs.dry_sequence_breakers[n] = dry_sequence_breakers[n].encode("UTF-8")
-        else:
-            inputs.dry_sequence_breakers[n] = "".encode("UTF-8")
+
+    if dry_multiplier <= 0 or dry_sequence_breakers is None: # prevent explicitly set to None, retain old behavior
+        dry_sequence_breakers = []
+
+    dry_sequence_breakers = dry_sequence_breakers[:dry_seq_break_max]
+    inputs.dry_sequence_breakers_len = len(dry_sequence_breakers)
+    inputs.dry_sequence_breakers = (ctypes.c_char_p * inputs.dry_sequence_breakers_len)()
+
+    for n, breaker in enumerate(dry_sequence_breakers):
+        inputs.dry_sequence_breakers[n] = breaker.encode("UTF-8")
 
     if sampler_order and 0 < len(sampler_order) <= sampler_order_max:
         try:
@@ -993,13 +1040,18 @@ def generate(genparams, is_quiet=False, stream_flag=False):
         except TypeError as e:
             print("ERROR: sampler_order must be a list of integers: " + str(e))
     inputs.seed = seed
-    for n in range(stop_token_max):
-        if not stop_sequence or n >= len(stop_sequence):
-            inputs.stop_sequence[n] = "".encode("UTF-8")
-        elif stop_sequence[n]==None:
-            inputs.stop_sequence[n] = "".encode("UTF-8")
+
+    if stop_sequence is None:
+        stop_sequence = []
+    stop_sequence = stop_sequence[:stop_token_max]
+    inputs.stop_sequence_len = len(stop_sequence)
+    inputs.stop_sequence = (ctypes.c_char_p * inputs.stop_sequence_len)()
+
+    for n, sequence in enumerate(stop_sequence):
+        if sequence:
+            inputs.stop_sequence[n] = sequence.encode("UTF-8")
         else:
-            inputs.stop_sequence[n] = stop_sequence[n].encode("UTF-8")
+            inputs.stop_sequence[n] = "".encode("UTF-8")
 
     bias_list = []
     try:
@@ -1008,25 +1060,27 @@ def generate(genparams, is_quiet=False, stream_flag=False):
     except Exception as ex:
         print(f"Logit bias dictionary is invalid: {ex}")
 
-    for n in range(logit_bias_max):
-        if n >= len(bias_list):
+    bias_list = bias_list[:logit_bias_max]
+    inputs.logit_biases_len = len(bias_list)
+    inputs.logit_biases = (logit_bias * inputs.logit_biases_len)()
+    for n, lb in enumerate(bias_list):
+        try:
+            t_id = int(lb['key'])
+            bias = float(lb['value'])
+            t_id = -1 if t_id < 0 else t_id
+            bias = (bias_max_value if bias > bias_max_value else (bias_min_value if bias < bias_min_value else bias))
+            inputs.logit_biases[n] = logit_bias(t_id, bias)
+        except Exception as ex:
             inputs.logit_biases[n] = logit_bias(-1, 0.0)
-        else:
-            try:
-                t_id = int(bias_list[n]['key'])
-                bias = float(bias_list[n]['value'])
-                t_id = -1 if t_id < 0 else t_id
-                bias = (bias_max_value if bias > bias_max_value else (bias_min_value if bias < bias_min_value else bias))
-                inputs.logit_biases[n] = logit_bias(t_id, bias)
-            except Exception as ex:
-                inputs.logit_biases[n] = logit_bias(-1, 0.0)
-                print(f"Skipped unparsable logit bias:{ex}")
+            print(f"Skipped unparsable logit bias:{ex}")
 
-    for n in range(ban_token_max):
-        if not banned_tokens or n >= len(banned_tokens):
-            inputs.banned_tokens[n] = "".encode("UTF-8")
-        else:
-            inputs.banned_tokens[n] = banned_tokens[n].encode("UTF-8")
+    if banned_tokens is None:
+        banned_tokens = []
+    banned_tokens = banned_tokens[:ban_token_max]
+    inputs.banned_tokens_len = len(banned_tokens)
+    inputs.banned_tokens = (ctypes.c_char_p * inputs.banned_tokens_len)()
+    for n, tok in enumerate(banned_tokens):
+        inputs.banned_tokens[n] = tok.encode("UTF-8")
 
     currentusergenkey = genkey
     totalgens += 1
@@ -1035,7 +1089,7 @@ def generate(genparams, is_quiet=False, stream_flag=False):
     if pendingabortkey!="" and pendingabortkey==genkey:
         print(f"\nDeferred Abort for GenKey: {pendingabortkey}")
         pendingabortkey = ""
-        return {"text":"","status":-1,"stopreason":-1}
+        return {"text":"","status":-1,"stopreason":-1, "prompt_tokens":0, "completion_tokens": 0, "total_tokens": 0}
     else:
         ret = handle.generate(inputs)
         outstr = ""
@@ -1046,10 +1100,10 @@ def generate(genparams, is_quiet=False, stream_flag=False):
                 sindex = outstr.find(trim_str)
                 if sindex != -1 and trim_str!="":
                     outstr = outstr[:sindex]
-        return {"text":outstr,"status":ret.status,"stopreason":ret.stopreason}
+        return {"text":outstr,"status":ret.status,"stopreason":ret.stopreason,"prompt_tokens":ret.prompt_tokens, "completion_tokens": ret.completion_tokens}
 
 
-def sd_load_model(model_filename,vae_filename,lora_filename):
+def sd_load_model(model_filename,vae_filename,lora_filename,t5xxl_filename,clipl_filename,clipg_filename):
     global args
     inputs = sd_load_model_inputs()
     inputs.debugmode = args.debugmode
@@ -1071,6 +1125,9 @@ def sd_load_model(model_filename,vae_filename,lora_filename):
     inputs.vae_filename = vae_filename.encode("UTF-8")
     inputs.lora_filename = lora_filename.encode("UTF-8")
     inputs.lora_multiplier = args.sdloramult
+    inputs.t5xxl_filename = t5xxl_filename.encode("UTF-8")
+    inputs.clipl_filename = clipl_filename.encode("UTF-8")
+    inputs.clipg_filename = clipg_filename.encode("UTF-8")
     inputs = set_backend_props(inputs)
     ret = handle.sd_load_model(inputs)
     return ret
@@ -1209,6 +1266,41 @@ def extract_json_from_string(input_string):
         pass
     return []
 
+def parse_last_logprobs(lastlogprobs):
+    if not lastlogprobs:
+        return None
+    logprobsdict = {}
+    logprobsdict['content'] = []
+    logprobsdict['tokens'] = []
+    logprobsdict['token_logprobs'] = []
+    logprobsdict['top_logprobs'] = []
+    logprobsdict['text_offset'] = []
+    text_offset_counter = 0
+    for i in range(lastlogprobs.count):
+        lp_content_item = {}
+        logprob_item = lastlogprobs.logprob_items[i]
+        toptoken = ctypes.string_at(logprob_item.selected_token).decode("UTF-8","ignore")
+        logprobsdict['tokens'].append(toptoken)
+        lp_content_item['token'] = toptoken
+        logprobsdict['token_logprobs'].append(logprob_item.selected_logprob)
+        lp_content_item['logprob'] = logprob_item.selected_logprob
+        lp_content_item['bytes'] = list(toptoken.encode('utf-8'))
+        lp_content_item['top_logprobs'] = []
+        logprobsdict['text_offset'].append(text_offset_counter)
+        text_offset_counter += len(toptoken)
+        tops = {}
+        for j in range(min(logprob_item.option_count,logprobs_max)):
+            tl_item = {}
+            tl_item['logprob'] = logprob_item.logprobs[j]
+            tokstr = ctypes.string_at(logprob_item.tokens[j]).decode("UTF-8","ignore")
+            tops[tokstr] = logprob_item.logprobs[j]
+            tl_item['token'] = tokstr
+            tl_item['bytes'] = list(tokstr.encode('utf-8'))
+            lp_content_item['top_logprobs'].append(tl_item)
+        logprobsdict['top_logprobs'].append(tops)
+        logprobsdict['content'].append(lp_content_item)
+    return logprobsdict
+
 def transform_genparams(genparams, api_format):
     global chatcompl_adapter
     #api format 1=basic,2=kai,3=oai,4=oai-chat,5=interrogate
@@ -1224,13 +1316,14 @@ def transform_genparams(genparams, api_format):
     if api_format==1:
         genparams["prompt"] = genparams.get('text', "")
         genparams["top_k"] = int(genparams.get('top_k', 120))
-        genparams["max_length"] = genparams.get('max', 180)
+        genparams["max_length"] = genparams.get('max', 200)
 
     elif api_format==2:
         pass
 
     elif api_format==3 or api_format==4:
-        genparams["max_length"] = genparams.get('max_tokens', (400 if api_format==4 else 180))
+        default_max_tok = (400 if api_format==4 else 200)
+        genparams["max_length"] = genparams.get('max_tokens', genparams.get('max_completion_tokens', default_max_tok))
         presence_penalty = genparams.get('presence_penalty', genparams.get('frequency_penalty', 0.0))
         genparams["presence_penalty"] = presence_penalty
         # openai allows either a string or a list as a stop sequence
@@ -1390,10 +1483,13 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                         detected_upload_filename = re.findall(r'Content-Disposition.*name="file"; filename="(.*)"', fpart.decode('utf-8',errors='ignore'))
                         if detected_upload_filename and len(detected_upload_filename)>0:
                             utfprint(f"Detected uploaded file: {detected_upload_filename[0]}")
-                            file_data = fpart.split(b'\r\n\r\n')[1].rsplit(b'\r\n', 1)[0]
-                            file_data_base64 = base64.b64encode(file_data).decode('utf-8',"ignore")
-                            base64_string = f"data:audio/wav;base64,{file_data_base64}"
-                            return base64_string
+                            file_content_start = fpart.find(b'\r\n\r\n') + 4  # Position after headers
+                            file_content_end = fpart.rfind(b'\r\n')  # Ending boundary
+                            if file_content_start != -1 and file_content_end != -1:
+                                file_data = fpart[file_content_start:file_content_end]
+                                file_data_base64 = base64.b64encode(file_data).decode('utf-8',"ignore")
+                                base64_string = f"data:audio/wav;base64,{file_data_base64}"
+                                return base64_string
             print("Uploaded file not found.")
             return None
         except Exception as e:
@@ -1414,7 +1510,7 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 
             return generate(genparams=genparams,is_quiet=is_quiet,stream_flag=stream_flag)
 
-        genout = {"text": "", "status": -1, "stopreason": -1}
+        genout = {"text": "", "status": -1, "stopreason": -1, "prompt_tokens":0, "completion_tokens": 0, "total_tokens": 0}
         if stream_flag:
             loop = asyncio.get_event_loop()
             executor = ThreadPoolExecutor()
@@ -1423,7 +1519,15 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             genout = run_blocking()
 
         recvtxt = genout['text']
+        prompttokens = genout['prompt_tokens']
+        comptokens = genout['completion_tokens']
         currfinishreason = ("length" if (genout['stopreason'] != 1) else "stop")
+
+        # grab logprobs if not streaming
+        logprobsdict = None
+        if not stream_flag and ("logprobs" in genparams and genparams["logprobs"]):
+            lastlogprobs = handle.last_logprobs()
+            logprobsdict = parse_last_logprobs(lastlogprobs)
 
         # flag instance as non-idle for a while
         washordereq = genparams.get('genkey', '').startswith('HORDEREQ_')
@@ -1437,9 +1541,9 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         if api_format == 1:
             res = {"data": {"seqs": [recvtxt]}}
         elif api_format == 3:
-            res = {"id": "cmpl-1", "object": "text_completion", "created": 1, "model": friendlymodelname,
-                   "usage": {"prompt_tokens": 100, "completion_tokens": 100, "total_tokens": 200},
-                   "choices": [{"text": recvtxt, "index": 0, "finish_reason": currfinishreason}]}
+            res = {"id": "cmpl-A1", "object": "text_completion", "created": int(time.time()), "model": friendlymodelname,
+                   "usage": {"prompt_tokens": prompttokens, "completion_tokens": comptokens, "total_tokens": (prompttokens+comptokens)},
+                   "choices": [{"text": recvtxt, "index": 0, "finish_reason": currfinishreason, "logprobs":logprobsdict}]}
         elif api_format == 4:
             using_openai_tools = genparams.get('using_openai_tools', False)
             tool_calls = []
@@ -1447,13 +1551,13 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 tool_calls = extract_json_from_string(recvtxt)
                 if tool_calls and len(tool_calls)>0:
                     recvtxt = None
-            res = {"id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": friendlymodelname,
-                   "usage": {"prompt_tokens": 100, "completion_tokens": 100, "total_tokens": 200},
-                   "choices": [{"index": 0, "message": {"role": "assistant", "content": recvtxt, "tool_calls": tool_calls}, "finish_reason": currfinishreason}]}
+            res = {"id": "chatcmpl-A1", "object": "chat.completion", "created": int(time.time()), "model": friendlymodelname,
+                   "usage": {"prompt_tokens": prompttokens, "completion_tokens": comptokens, "total_tokens": (prompttokens+comptokens)},
+                   "choices": [{"index": 0, "message": {"role": "assistant", "content": recvtxt, "tool_calls": tool_calls}, "finish_reason": currfinishreason, "logprobs":logprobsdict}]}
         elif api_format == 5:
             res = {"caption": end_trim_to_sentence(recvtxt)}
         else:
-            res = {"results": [{"text": recvtxt, "finish_reason": currfinishreason}]}
+            res = {"results": [{"text": recvtxt, "finish_reason": currfinishreason, "logprobs":logprobsdict, "prompt_tokens": prompttokens, "completion_tokens": comptokens}]}
 
         try:
             return res
@@ -1475,6 +1579,7 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
     async def handle_sse_stream(self, genparams, api_format):
         global friendlymodelname, currfinishreason
         self.send_response(200)
+        self.send_header("X-Accel-Buffering", "no")
         self.send_header("cache-control", "no-cache")
         self.send_header("connection", "keep-alive")
         self.end_headers(content_type='text/event-stream')
@@ -1510,7 +1615,7 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
                 if tokenStr!="" or streamDone:
                     sseq = genparams.get('stop_sequence', [])
                     trimstop = genparams.get('trim_stop', False)
-                    if trimstop and not streamDone and string_contains_sequence_substring(tokenStr,sseq):
+                    if trimstop and not streamDone and string_contains_or_overlaps_sequence_substring(tokenStr,sseq):
                         tokenReserve += tokenStr
                         await asyncio.sleep(async_sleep_short) #if a stop sequence could trigger soon, do not send output
                     else:
@@ -1527,10 +1632,10 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
 
                         if tokenStr!="" or streamDone:
                             if api_format == 4:  # if oai chat, set format to expected openai streaming response
-                                event_str = json.dumps({"id":"koboldcpp","object":"chat.completion.chunk","created":1,"model":friendlymodelname,"choices":[{"index":0,"finish_reason":currfinishreason,"delta":{'role':'assistant','content':tokenStr}}]})
+                                event_str = json.dumps({"id":"koboldcpp","object":"chat.completion.chunk","created":int(time.time()),"model":friendlymodelname,"choices":[{"index":0,"finish_reason":currfinishreason,"delta":{'role':'assistant','content':tokenStr}}]})
                                 await self.send_oai_sse_event(event_str)
                             elif api_format == 3:  # non chat completions
-                                event_str = json.dumps({"id":"koboldcpp","object":"text_completion","created":1,"model":friendlymodelname,"choices":[{"index":0,"finish_reason":currfinishreason,"text":tokenStr}]})
+                                event_str = json.dumps({"id":"koboldcpp","object":"text_completion","created":int(time.time()),"model":friendlymodelname,"choices":[{"index":0,"finish_reason":currfinishreason,"text":tokenStr}]})
                                 await self.send_oai_sse_event(event_str)
                             else:
                                 event_str = json.dumps({"token": tokenStr, "finish_reason":currfinishreason})
@@ -1606,7 +1711,7 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
         return True
 
     def noscript_webui(self):
-        global modelbusy
+        global modelbusy, sslvalid
         import html
         import urllib.parse as urlparse
         parsed_url = urlparse.urlparse(self.path)
@@ -1630,9 +1735,10 @@ class ServerRequestHandler(http.server.SimpleHTTPRequestHandler):
             else:
                 if max_length>512:
                     max_length = 512
-                epurl = f"http://localhost:{args.port}"
+                httpsaffix = ("https" if sslvalid else "http")
+                epurl = f"{httpsaffix}://localhost:{args.port}"
                 if args.host!="":
-                    epurl = f"http://{args.host}:{args.port}"
+                    epurl = f"{httpsaffix}://{args.host}:{args.port}"
                 gen_payload = {"prompt": prompt,"max_length": max_length,"temperature": temperature,"prompt": prompt,"top_k": top_k,"top_p": top_p,"rep_pen": rep_pen,"ban_eos_token":ban_eos_token}
                 respjson = make_url_request(f'{epurl}/api/v1/generate', gen_payload)
                 reply = html.escape(respjson["results"][0]["text"])
@@ -1706,7 +1812,19 @@ Enter Prompt:<br>
             response_body = (json.dumps({"name":"KoboldAI Lite","short_name":"KoboldAI Lite","description":"Progressive Web App for KoboldAI Lite","start_url":"./","scope":".","display":"standalone","background_color":"#303030","theme_color":"#337ab7","orientation":"portrait-primary","icons":[{"src":"data:image/png;base64,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","type":"image/png","sizes":"150x150"}]}).encode())
 
         elif self.path.endswith(('/api/v1/model', '/api/latest/model')):
-            response_body = (json.dumps({'result': friendlymodelname }).encode())
+            auth_ok = True
+            if password and password !="":
+                auth_header = None
+                auth_ok = False
+                if 'Authorization' in self.headers:
+                    auth_header = self.headers['Authorization']
+                elif 'authorization' in self.headers:
+                    auth_header = self.headers['authorization']
+                if auth_header != None and auth_header.startswith('Bearer '):
+                    token = auth_header[len('Bearer '):].strip()
+                    if token==password:
+                        auth_ok = True
+            response_body = (json.dumps({'result': (friendlymodelname if auth_ok else "koboldcpp/protected-model") }).encode())
 
         elif self.path.endswith(('/api/v1/config/max_length', '/api/latest/config/max_length')):
             response_body = (json.dumps({"value": maxhordelen}).encode())
@@ -1744,7 +1862,8 @@ Enter Prompt:<br>
             lastseed = handle.get_last_seed()
             uptime = time.time() - start_time
             idletime = time.time() - last_req_time
-            response_body = (json.dumps({"last_process":lastp,"last_eval":laste,"last_token_count":lastc, "last_seed":lastseed, "total_gens":totalgens, "stop_reason":stopreason, "total_img_gens":totalimggens, "queue":requestsinqueue, "idle":(0 if modelbusy.locked() else 1), "hordeexitcounter":exitcounter, "uptime":uptime, "idletime":idletime}).encode())
+            is_quiet = True if (args.quiet and args.debugmode != 1) else False
+            response_body = (json.dumps({"last_process":lastp,"last_eval":laste,"last_token_count":lastc, "last_seed":lastseed, "total_gens":totalgens, "stop_reason":stopreason, "total_img_gens":totalimggens, "queue":requestsinqueue, "idle":(0 if modelbusy.locked() else 1), "hordeexitcounter":exitcounter, "uptime":uptime, "idletime":idletime, "quiet":is_quiet}).encode())
 
         elif self.path.endswith('/api/extra/generate/check'):
             if not self.secure_endpoint():
@@ -1755,8 +1874,17 @@ Enter Prompt:<br>
                 pendtxtStr = ctypes.string_at(pendtxt).decode("UTF-8","ignore")
             response_body = (json.dumps({"results": [{"text": pendtxtStr}]}).encode())
 
+        elif self.path.endswith('/api/extra/last_logprobs'):
+            if not self.secure_endpoint():
+                return
+            logprobsdict = None
+            if requestsinqueue==0 and totalgens>0 and currentusergenkey=="":
+                lastlogprobs = handle.last_logprobs()
+                logprobsdict = parse_last_logprobs(lastlogprobs)
+            response_body = (json.dumps({"logprobs":logprobsdict}).encode())
+
         elif self.path.endswith('/v1/models'):
-            response_body = (json.dumps({"object":"list","data":[{"id":friendlymodelname,"object":"model","created":1,"owned_by":"koboldcpp","permission":[],"root":"koboldcpp"}]}).encode())
+            response_body = (json.dumps({"object":"list","data":[{"id":friendlymodelname,"object":"model","created":int(time.time()),"owned_by":"koboldcpp","permission":[],"root":"koboldcpp"}]}).encode())
 
         elif self.path.endswith('/sdapi/v1/sd-models'):
             if friendlysdmodelname=="inactive" or fullsdmodelpath=="":
@@ -1777,6 +1905,9 @@ Enter Prompt:<br>
 
         elif self.path.endswith(('/api/tags')): #ollama compatible
             response_body = (json.dumps({"models":[{"name":"koboldcpp","model":friendlymodelname,"modified_at":"2024-07-19T15:26:55.6122841+08:00","size":394998579,"digest":"b5dc5e784f2a3ee1582373093acf69a2f4e2ac1710b253a001712b86a61f88bb","details":{"parent_model":"","format":"gguf","family":"koboldcpp","families":["koboldcpp"],"parameter_size":"128M","quantization_level":"Q4_0"}}]}).encode())
+
+        elif self.path.endswith(('/.well-known/serviceinfo')):
+            response_body = (json.dumps({"version":"0.2","software":{"name":"KoboldCpp","version":KcppVersion,"repository":"https://github.com/LostRuins/koboldcpp","homepage":"https://github.com/LostRuins/koboldcpp","logo":"https://raw.githubusercontent.com/LostRuins/koboldcpp/refs/heads/concedo/niko.ico"},"api":{"koboldai":{"name":"KoboldAI API","rel_url":"/api","documentation":"https://lite.koboldai.net/koboldcpp_api","version":KcppVersion},"openai":{"name":"OpenAI API","rel_url ":"/v1","documentation":"https://openai.com/documentation/api","version":KcppVersion}}}).encode())
 
         elif self.path=="/api" or self.path=="/docs" or self.path.startswith(('/api/?json=','/api?json=','/docs/?json=','/docs?json=')):
             content_type = 'text/html'
@@ -1899,6 +2030,24 @@ Enter Prompt:<br>
                     pendtxtStr = ctypes.string_at(pendtxt).decode("UTF-8","ignore")
             response_body = (json.dumps({"results": [{"text": pendtxtStr}]}).encode())
 
+        elif self.path.endswith('/api/extra/last_logprobs'):
+            if not self.secure_endpoint():
+                return
+            logprobsdict = None
+            multiuserkey = ""
+            try:
+                tempbody = json.loads(body)
+                if isinstance(tempbody, dict):
+                    multiuserkey = tempbody.get('genkey', "")
+            except Exception as e:
+                multiuserkey = ""
+
+            if totalgens>0:
+                if (multiuserkey=="" and multiuserkey==currentusergenkey and requestsinqueue==0) or (multiuserkey!="" and multiuserkey==currentusergenkey): #avoid leaking prompts in multiuser
+                    lastlogprobs = handle.last_logprobs()
+                    logprobsdict = parse_last_logprobs(lastlogprobs)
+            response_body = (json.dumps({"logprobs":logprobsdict}).encode())
+
         if response_body is not None:
             self.send_response(response_code)
             self.send_header('content-length', str(len(response_body)))
@@ -1908,6 +2057,8 @@ Enter Prompt:<br>
 
         reqblocking = False
         muint = int(args.multiuser)
+        if muint<=0 and ((args.whispermodel and args.whispermodel!="") or (args.sdmodel and args.sdmodel!="")):
+            muint = 2 # this prevents errors when using voice/img together with text
         multiuserlimit = ((muint-1) if muint > 1 else 6)
         #backwards compatibility for up to 7 concurrent requests, use default limit of 7 if multiuser set to 1
         if muint > 0 and requestsinqueue < multiuserlimit:
@@ -1953,7 +2104,7 @@ Enter Prompt:<br>
                     self.send_response(503)
                     self.end_headers(content_type='application/json')
                     self.wfile.write(json.dumps({"detail": {
-                            "msg": "No LLaVA model loaded",
+                            "msg": "No Vision model loaded",
                             "type": "service_unavailable",
                         }}).encode())
                     return
@@ -1994,8 +2145,9 @@ Enter Prompt:<br>
                         return
 
                 is_quiet = args.quiet
+                utfprint(f"\n{datetime.now().strftime('[%H:%M:%S] Input Received')}")
                 if (args.debugmode != -1 and not is_quiet) or args.debugmode >= 1:
-                    utfprint("\nInput: " + json.dumps(genparams))
+                    utfprint(f"Input: " + json.dumps(genparams))
 
                 if args.foreground:
                     bring_terminal_to_foreground()
@@ -2157,7 +2309,7 @@ def RunServerMultiThreaded(addr, port):
                 finally:
                     exitcounter = 999
                     self.httpd.server_close()
-                    sys.exit(0)
+                    os._exit(0)
         def stop(self):
             global exitcounter
             exitcounter = 999
@@ -2184,7 +2336,7 @@ def show_gui():
     from tkinter.filedialog import asksaveasfile
 
     # if args received, launch
-    if len(sys.argv) != 1:
+    if len(sys.argv) != 1 and not args.showgui:
         import tkinter as tk
         root = tk.Tk() #we dont want the useless window to be visible, but we want it in taskbar
         root.attributes("-alpha", 0)
@@ -2193,7 +2345,7 @@ def show_gui():
         root.quit()
         if args.model_param and args.model_param!="" and (args.model_param.lower().endswith('.kcpps') or args.model_param.lower().endswith('.kcppt')):
             load_config_cli(args.model_param)
-        if not args.model_param and not args.sdmodel and not args.whispermodel:
+        if not args.model_param and not args.sdmodel and not args.whispermodel and not args.nomodel:
             global exitcounter
             exitcounter = 999
             exit_with_error(2,"No ggml model or kcpps file was selected. Exiting.")
@@ -2209,8 +2361,8 @@ def show_gui():
 
     import customtkinter as ctk
     nextstate = 0 #0=exit, 1=launch
-    original_windowwidth = 550
-    original_windowheight = 550
+    original_windowwidth = 580
+    original_windowheight = 560
     windowwidth = original_windowwidth
     windowheight = original_windowheight
     ctk.set_appearance_mode("dark")
@@ -2278,7 +2430,7 @@ def show_gui():
             gtooltip_box.withdraw()
             gtooltip_box.overrideredirect(True)
             gtooltip_label = ctk.CTkLabel(gtooltip_box, text=tooltip_text, text_color="#000000", fg_color="#ffffe0")
-            gtooltip_label.pack(expand=True, padx=2, pady=1)
+            gtooltip_label.pack(expand=True, ipadx=2, ipady=1)
         else:
             gtooltip_label.configure(text=tooltip_text)
 
@@ -2317,7 +2469,7 @@ def show_gui():
 
     if not any(runopts):
         exitcounter = 999
-        exit_with_error(2,"KoboldCPP couldn't locate any backends to use (i.e Default, OpenBLAS, CLBlast, CuBLAS).\n\nTo use the program, please run the 'make' command from the directory.","No Backends Available!")
+        exit_with_error(2,"KoboldCPP couldn't locate any backends to use (i.e Default, Vulkan, CLBlast, CuBLAS).\n\nTo use the program, please run the 'make' command from the directory.","No Backends Available!")
 
     # Vars - should be in scope to be used by multiple widgets
     gpulayers_var = ctk.StringVar(value="-1")
@@ -2344,6 +2496,7 @@ def show_gui():
     rowsplit_var = ctk.IntVar()
 
     contextshift = ctk.IntVar(value=1)
+    fastforward = ctk.IntVar(value=1)
     remotetunnel = ctk.IntVar(value=0)
     smartcontext = ctk.IntVar()
     flashattention = ctk.IntVar(value=0)
@@ -2358,6 +2511,7 @@ def show_gui():
     lora_base_var = ctk.StringVar()
     preloadstory_var = ctk.StringVar()
     mmproj_var = ctk.StringVar()
+    nomodel = ctk.IntVar(value=0)
 
     port_var = ctk.StringVar(value=defaultport)
     host_var = ctk.StringVar(value="")
@@ -2376,6 +2530,9 @@ def show_gui():
     sd_lora_var = ctk.StringVar()
     sd_loramult_var = ctk.StringVar(value="1.0")
     sd_vae_var = ctk.StringVar()
+    sd_t5xxl_var = ctk.StringVar()
+    sd_clipl_var = ctk.StringVar()
+    sd_clipg_var = ctk.StringVar()
     sd_vaeauto_var = ctk.IntVar(value=0)
     sd_clamped_var = ctk.StringVar(value="0")
     sd_threads_var = ctk.StringVar(value=str(default_threads))
@@ -2458,8 +2615,12 @@ def show_gui():
         entry = ctk.CTkEntry(parent, width, textvariable=var)
         button = ctk.CTkButton(parent, 50, text="Browse", command= lambda a=var,b=searchtext:getfilename(a,b))
         if singlerow:
-            entry.grid(row=row, column=1, padx=8, stick="w")
-            button.grid(row=row, column=1, padx=(width+12), stick="nw")
+            if singlecol:
+                entry.grid(row=row, column=0, padx=(84+8), stick="w")
+                button.grid(row=row, column=0, padx=(84+width+12), stick="nw")
+            else:
+                entry.grid(row=row, column=1, padx=8, stick="w")
+                button.grid(row=row, column=1, padx=(width+12), stick="nw")
         else:
             if singlecol:
                 entry.grid(row=row+1, column=0, columnspan=3, padx=8, stick="nw")
@@ -2479,6 +2640,7 @@ def show_gui():
             fetch_gpu_properties(False,True,True)
         else:
             fetch_gpu_properties(True,True,True)
+        found_new_backend = False
         #autopick cublas if suitable, requires at least 3.5GB VRAM to auto pick
         #we do not want to autoselect hip/cublas if the user has already changed their desired backend!
         if exitcounter < 100 and MaxMemory[0]>3500000000 and (("Use CuBLAS" in runopts and CUDevicesNames[0]!="") or "Use hipBLAS (ROCm)" in runopts) and (any(CUDevicesNames) or any(CLDevicesNames)) and runmode_untouched:
@@ -2486,17 +2648,22 @@ def show_gui():
                 runopts_var.set("Use CuBLAS")
                 gpu_choice_var.set("1")
                 print("Auto Selected CUDA Backend...\n")
+                found_new_backend = True
             elif "Use hipBLAS (ROCm)" in runopts:
                 runopts_var.set("Use hipBLAS (ROCm)")
                 gpu_choice_var.set("1")
                 print("Auto Selected HIP Backend...\n")
+                found_new_backend = True
         elif exitcounter < 100 and (1 in VKIsDGPU) and runmode_untouched and "Use Vulkan" in runopts:
             for i in range(0,len(VKIsDGPU)):
                 if VKIsDGPU[i]==1:
                     runopts_var.set("Use Vulkan")
                     gpu_choice_var.set(str(i+1))
                     print("Auto Selected Vulkan Backend...\n")
+                    found_new_backend = True
                     break
+        if not found_new_backend:
+            print("Auto Selected Default Backend...\n")
         changed_gpu_choice_var()
 
     def on_picked_model_file(filepath):
@@ -2509,8 +2676,8 @@ def show_gui():
     def setup_backend_tooltip(parent):
         # backend count label with the tooltip function
         nl = '\n'
-        tooltxt = f"Number of backends you have built and available." + (f"\n\nMissing Backends: \n\n{nl.join(antirunopts)}" if len(runopts) != 6 else "")
-        num_backends_built = makelabel(parent, str(len(runopts)) + f"/9", 5, 2,tooltxt)
+        tooltxt = f"Number of backends you have built and available." + (f"\n\nMissing Backends: \n\n{nl.join(antirunopts)}" if len(runopts) < 8 else "")
+        num_backends_built = makelabel(parent, str(len(runopts)) + f"/8", 5, 2,tooltxt)
         num_backends_built.grid(row=1, column=1, padx=195, pady=0)
         num_backends_built.configure(text_color="#00ff00")
 
@@ -2529,10 +2696,13 @@ def show_gui():
         predicted_gpu_layers = autoset_gpu_layers(int(contextsize_text[context_var.get()]),(sd_quant_var.get()==1),int(blasbatchsize_values[int(blas_size_var.get())]))
         max_gpu_layers = (f"/{modelfile_extracted_meta[0][0]+3}" if (modelfile_extracted_meta and modelfile_extracted_meta[0] and modelfile_extracted_meta[0][0]!=0) else "")
         index = runopts_var.get()
-        gpu_be = (index == "Use Vulkan" or index == "Vulkan NoAVX2 (Old CPU)" or index == "Use CLBlast" or index == "CLBlast NoAVX2 (Old CPU)" or index == "Use CuBLAS" or index == "Use hipBLAS (ROCm)")
+        gpu_be = (index == "Use Vulkan" or index == "Use Vulkan (Old CPU)" or index == "Use CLBlast" or index == "Use CLBlast (Old CPU)" or index == "Use CuBLAS" or index == "Use hipBLAS (ROCm)")
         layercounter_label.grid(row=6, column=1, padx=75, sticky="W")
         quick_layercounter_label.grid(row=6, column=1, padx=75, sticky="W")
-        if gpu_be and gpulayers_var.get()=="-1" and predicted_gpu_layers>0:
+        if sys.platform=="darwin" and gpulayers_var.get()=="-1":
+            quick_layercounter_label.configure(text=f"(Auto: All Layers)")
+            layercounter_label.configure(text=f"(Auto: All Layers)")
+        elif gpu_be and gpulayers_var.get()=="-1" and predicted_gpu_layers>0:
             quick_layercounter_label.configure(text=f"(Auto: {predicted_gpu_layers}{max_gpu_layers} Layers)")
             layercounter_label.configure(text=f"(Auto: {predicted_gpu_layers}{max_gpu_layers} Layers)")
         elif gpu_be and gpulayers_var.get()=="-1" and predicted_gpu_layers<=0 and (modelfile_extracted_meta and modelfile_extracted_meta[1]):
@@ -2554,10 +2724,10 @@ def show_gui():
             try:
                 s = int(gpu_choice_var.get())-1
                 v = runopts_var.get()
-                if v == "Use Vulkan" or v == "Vulkan NoAVX2 (Old CPU)":
+                if v == "Use Vulkan" or v == "Use Vulkan (Old CPU)":
                     quick_gpuname_label.configure(text=VKDevicesNames[s])
                     gpuname_label.configure(text=VKDevicesNames[s])
-                elif v == "Use CLBlast" or v == "CLBlast NoAVX2 (Old CPU)":
+                elif v == "Use CLBlast" or v == "Use CLBlast (Old CPU)":
                     quick_gpuname_label.configure(text=CLDevicesNames[s])
                     gpuname_label.configure(text=CLDevicesNames[s])
                 else:
@@ -2572,10 +2742,16 @@ def show_gui():
     gpu_choice_var.trace("w", changed_gpu_choice_var)
     gpulayers_var.trace("w", changed_gpulayers_estimate)
 
+    def togglefastforward(a,b,c):
+        if fastforward.get()==0:
+            contextshift.set(0)
+            togglectxshift(1,1,1)
+
     def togglectxshift(a,b,c):
         if contextshift.get()==0:
             smartcontextbox.grid()
         else:
+            fastforward.set(1)
             smartcontextbox.grid_remove()
 
         if contextshift.get()==0 and flashattention.get()==1:
@@ -2607,19 +2783,19 @@ def show_gui():
         global runmode_untouched
         runmode_untouched = False
         index = runopts_var.get()
-        if index == "Use Vulkan" or index == "Vulkan NoAVX2 (Old CPU)" or index == "Use CLBlast" or index == "CLBlast NoAVX2 (Old CPU)" or index == "Use CuBLAS" or index == "Use hipBLAS (ROCm)":
+        if index == "Use Vulkan" or index == "Use Vulkan (Old CPU)" or index == "Use CLBlast" or index == "Use CLBlast (Old CPU)" or index == "Use CuBLAS" or index == "Use hipBLAS (ROCm)":
             quick_gpuname_label.grid(row=3, column=1, padx=75, sticky="W")
             gpuname_label.grid(row=3, column=1, padx=75, sticky="W")
             gpu_selector_label.grid(row=3, column=0, padx = 8, pady=1, stick="nw")
             quick_gpu_selector_label.grid(row=3, column=0, padx = 8, pady=1, stick="nw")
-            if index == "Use CLBlast" or index == "CLBlast NoAVX2 (Old CPU)":
+            if index == "Use CLBlast" or index == "Use CLBlast (Old CPU)":
                 gpu_selector_box.grid(row=3, column=1, padx=8, pady=1, stick="nw")
                 quick_gpu_selector_box.grid(row=3, column=1, padx=8, pady=1, stick="nw")
                 CUDA_gpu_selector_box.grid_remove()
                 CUDA_quick_gpu_selector_box.grid_remove()
                 if gpu_choice_var.get()=="All":
                     gpu_choice_var.set("1")
-            elif index == "Use Vulkan" or index == "Vulkan NoAVX2 (Old CPU)" or index == "Use CuBLAS" or index == "Use hipBLAS (ROCm)":
+            elif index == "Use Vulkan" or index == "Use Vulkan (Old CPU)" or index == "Use CuBLAS" or index == "Use hipBLAS (ROCm)":
                 gpu_selector_box.grid_remove()
                 quick_gpu_selector_box.grid_remove()
                 CUDA_gpu_selector_box.grid(row=3, column=1, padx=8, pady=1, stick="nw")
@@ -2649,11 +2825,14 @@ def show_gui():
             tensor_split_entry.grid_remove()
             splitmode_box.grid_remove()
 
-        if index == "Use Vulkan":
+        if index == "Use Vulkan" or index == "Use Vulkan (Old CPU)":
             tensor_split_label.grid(row=8, column=0, padx = 8, pady=1, stick="nw")
             tensor_split_entry.grid(row=8, column=1, padx=8, pady=1, stick="nw")
+            quick_use_flashattn.grid_remove()
+        else:
+            quick_use_flashattn.grid(row=22, column=1, padx=8, pady=1,  stick="nw")
 
-        if index == "Use Vulkan" or index == "Vulkan NoAVX2 (Old CPU)" or index == "Use CLBlast" or index == "CLBlast NoAVX2 (Old CPU)" or index == "Use CuBLAS" or index == "Use hipBLAS (ROCm)":
+        if index == "Use Vulkan" or index == "Use Vulkan (Old CPU)" or index == "Use CLBlast" or index == "Use CLBlast (Old CPU)" or index == "Use CuBLAS" or index == "Use hipBLAS (ROCm)":
             gpu_layers_label.grid(row=6, column=0, padx = 8, pady=1, stick="nw")
             gpu_layers_entry.grid(row=6, column=1, padx=8, pady=1, stick="nw")
             quick_gpu_layers_label.grid(row=6, column=0, padx = 8, pady=1, stick="nw")
@@ -2673,7 +2852,7 @@ def show_gui():
 
 
     # presets selector
-    makelabel(quick_tab, "Presets:", 1,0,"Select a backend to use.\nOpenBLAS and NoBLAS runs purely on CPU only.\nCuBLAS runs on Nvidia GPUs, and is much faster.\nCLBlast works on all GPUs but is somewhat slower.\nNoAVX2 and Failsafe modes support older PCs.")
+    makelabel(quick_tab, "Presets:", 1,0,"Select a backend to use.\nCuBLAS runs on Nvidia GPUs, and is much faster.\nVulkan and CLBlast works on all GPUs but is somewhat slower.\nOtherwise, runs on CPU only.\nNoAVX2 and Failsafe modes support older PCs.")
 
     runoptbox = ctk.CTkComboBox(quick_tab, values=runopts, width=180,variable=runopts_var, state="readonly")
     runoptbox.grid(row=1, column=1,padx=8, stick="nw")
@@ -2701,25 +2880,26 @@ def show_gui():
         "Disable MMAP": [disablemmap,  "Avoids using mmap to load models if enabled"],
         "Use ContextShift": [contextshift, "Uses Context Shifting to reduce reprocessing.\nRecommended. Check the wiki for more info."],
         "Remote Tunnel": [remotetunnel,  "Creates a trycloudflare tunnel.\nAllows you to access koboldcpp from other devices over an internet URL."],
-        "Use FlashAttention": [flashattention, "Enable flash attention for GGUF models."],
         "Quiet Mode": [quietmode, "Prevents all generation related terminal output from being displayed."]
     }
 
     for idx, (name, properties) in enumerate(quick_boxes.items()):
         makecheckbox(quick_tab, name, properties[0], int(idx/2) + 20, idx % 2, tooltiptxt=properties[1])
 
+    quick_use_flashattn = makecheckbox(quick_tab, "Use FlashAttention", flashattention, 22, 1, tooltiptxt="Enable flash attention for GGUF models.")
+
     # context size
     makeslider(quick_tab, "Context Size:", contextsize_text, context_var, 0, len(contextsize_text)-1, 30, width=280, set=5,tooltip="What is the maximum context size to support. Model specific. You cannot exceed it.\nLarger contexts require more memory, and not all models support it.")
 
     # load model
-    makefileentry(quick_tab, "Model:", "Select GGUF or GGML Model File", model_var, 40, 280, onchoosefile=on_picked_model_file,tooltiptxt="Select a GGUF or GGML model file on disk to be loaded.")
+    makefileentry(quick_tab, "GGUF Model:", "Select GGUF or GGML Model File", model_var, 40, 280, onchoosefile=on_picked_model_file,tooltiptxt="Select a GGUF or GGML model file on disk to be loaded.")
     model_var.trace("w", gui_changed_modelfile)
 
     # Hardware Tab
     hardware_tab = tabcontent["Hardware"]
 
     # presets selector
-    makelabel(hardware_tab, "Presets:", 1,0,"Select a backend to use.\nOpenBLAS and NoBLAS runs purely on CPU only.\nCuBLAS runs on Nvidia GPUs, and is much faster.\nCLBlast works on all GPUs but is somewhat slower.\nNoAVX2 and Failsafe modes support older PCs.")
+    makelabel(hardware_tab, "Presets:", 1,0,"Select a backend to use.\nCuBLAS runs on Nvidia GPUs, and is much faster.\nVulkan and CLBlast works on all GPUs but is somewhat slower.\nOtherwise, runs on CPU only.\nNoAVX2 and Failsafe modes support older PCs.")
     runoptbox = ctk.CTkComboBox(hardware_tab, values=runopts,  width=180,variable=runopts_var, state="readonly")
     runoptbox.grid(row=1, column=1,padx=8, stick="nw")
     runoptbox.set(runopts[0]) # Set to first available option
@@ -2780,7 +2960,7 @@ def show_gui():
     # tokens checkboxes
     smartcontextbox = makecheckbox(tokens_tab, "Use SmartContext", smartcontext, 1,tooltiptxt="Uses SmartContext. Now considered outdated and not recommended.\nCheck the wiki for more info.")
     makecheckbox(tokens_tab, "Use ContextShift", contextshift, 2,tooltiptxt="Uses Context Shifting to reduce reprocessing.\nRecommended. Check the wiki for more info.", command=togglectxshift)
-
+    makecheckbox(tokens_tab, "Use FastForwarding", fastforward, 3,tooltiptxt="Use fast forwarding to recycle previous context (always reprocess if disabled).\nRecommended.", command=togglefastforward)
 
     # context size
     makeslider(tokens_tab, "Context Size:",contextsize_text, context_var, 0, len(contextsize_text)-1, 20, width=280, set=5,tooltip="What is the maximum context size to support. Model specific. You cannot exceed it.\nLarger contexts require more memory, and not all models support it.")
@@ -2811,7 +2991,7 @@ def show_gui():
     makefileentry(model_tab, "Model:", "Select GGUF or GGML Model File", model_var, 1,width=280, onchoosefile=on_picked_model_file,tooltiptxt="Select a GGUF or GGML model file on disk to be loaded.")
     makefileentry(model_tab, "Lora:", "Select Lora File",lora_var, 3,width=280,tooltiptxt="Select an optional GGML LoRA adapter to use.\nLeave blank to skip.")
     makefileentry(model_tab, "Lora Base:", "Select Lora Base File", lora_base_var, 5,width=280,tooltiptxt="Select an optional F16 GGML LoRA base file to use.\nLeave blank to skip.")
-    makefileentry(model_tab, "LLaVA mmproj:", "Select LLaVA mmproj File", mmproj_var, 7,width=280,tooltiptxt="Select a mmproj file to use for LLaVA.\nLeave blank to skip.")
+    makefileentry(model_tab, "Vision mmproj:", "Select Vision mmproj File", mmproj_var, 7,width=280,tooltiptxt="Select a mmproj file to use for vision models like LLaVA.\nLeave blank to skip.")
     makefileentry(model_tab, "Preloaded Story:", "Select Preloaded Story File", preloadstory_var, 9,width=280,tooltiptxt="Select an optional KoboldAI JSON savefile \nto be served on launch to any client.")
     makefileentry(model_tab, "ChatCompletions Adapter:", "Select ChatCompletions Adapter File", chatcompletionsadapter_var, 12, width=250, filetypes=[("JSON Adapter", "*.json")], tooltiptxt="Select an optional ChatCompletions Adapter JSON file to force custom instruct tags.")
     def pickpremadetemplate():
@@ -2823,6 +3003,7 @@ def show_gui():
     ctk.CTkButton(model_tab, 64, text="Pick Premade", command=pickpremadetemplate).grid(row=13, column=0, padx=322, stick="nw")
 
     mmproj_var.trace("w", gui_changed_modelfile)
+    makecheckbox(model_tab, "Allow Launch Without Models", nomodel, 15, tooltiptxt="Allows running the WebUI with no model loaded.")
 
     # Network Tab
     network_tab = tabcontent["Network"]
@@ -2836,8 +3017,8 @@ def show_gui():
     makecheckbox(network_tab, "Quiet Mode", quietmode, 4,tooltiptxt="Prevents all generation related terminal output from being displayed.")
     makecheckbox(network_tab, "NoCertify Mode (Insecure)", nocertifymode, 4, 1,tooltiptxt="Allows insecure SSL connections. Use this if you have cert errors and need to bypass certificate restrictions.")
 
-    makefileentry(network_tab, "SSL Cert:", "Select SSL cert.pem file",ssl_cert_var, 5, width=200 ,filetypes=[("Unencrypted Certificate PEM", "*.pem")], singlerow=True,tooltiptxt="Select your unencrypted .pem SSL certificate file for https.\nCan be generated with OpenSSL.")
-    makefileentry(network_tab, "SSL Key:", "Select SSL key.pem file", ssl_key_var, 7, width=200, filetypes=[("Unencrypted Key PEM", "*.pem")], singlerow=True,tooltiptxt="Select your unencrypted .pem SSL key file for https.\nCan be generated with OpenSSL.")
+    makefileentry(network_tab, "SSL Cert:", "Select SSL cert.pem file",ssl_cert_var, 5, width=200 ,filetypes=[("Unencrypted Certificate PEM", "*.pem")], singlerow=True, singlecol=False,tooltiptxt="Select your unencrypted .pem SSL certificate file for https.\nCan be generated with OpenSSL.")
+    makefileentry(network_tab, "SSL Key:", "Select SSL key.pem file", ssl_key_var, 7, width=200, filetypes=[("Unencrypted Key PEM", "*.pem")], singlerow=True, singlecol=False, tooltiptxt="Select your unencrypted .pem SSL key file for https.\nCan be generated with OpenSSL.")
     makelabelentry(network_tab, "Password: ", password_var, 8, 200,tooltip="Enter a password required to use this instance.\nThis key will be required for all text endpoints.\nImage endpoints are not secured.")
 
     # Horde Tab
@@ -2871,13 +3052,13 @@ def show_gui():
     # Image Gen Tab
 
     images_tab = tabcontent["Image Gen"]
-    makefileentry(images_tab, "Stable Diffusion Model (safetensors/gguf):", "Select Stable Diffusion Model File", sd_model_var, 1, width=280, singlecol=False, filetypes=[("*.safetensors *.gguf","*.safetensors *.gguf")], tooltiptxt="Select a .safetensors or .gguf Stable Diffusion model file on disk to be loaded.")
-    makelabelentry(images_tab, "Clamped Mode (Limit Resolution)", sd_clamped_var, 4, 50,tooltip="Limit generation steps and resolution settings for shared use.\nSet to 0 to disable, otherwise value is the size limit (min 512px).")
-    makelabelentry(images_tab, "Image Threads:" , sd_threads_var, 6, 50,tooltip="How many threads to use during image generation.\nIf left blank, uses same value as threads.")
+    makefileentry(images_tab, "Stable Diffusion Model (safetensors/gguf):", "Select Stable Diffusion Model File", sd_model_var, 1, width=280, singlecol=True, filetypes=[("*.safetensors *.gguf","*.safetensors *.gguf")], tooltiptxt="Select a .safetensors or .gguf Stable Diffusion model file on disk to be loaded.")
+    makelabelentry(images_tab, "Clamped Mode (Limit Resolution):", sd_clamped_var, 4, 50, padx=290,singleline=True,tooltip="Limit generation steps and resolution settings for shared use.\nSet to 0 to disable, otherwise value is the size limit (min 512px).")
+    makelabelentry(images_tab, "Image Threads:" , sd_threads_var, 6, 50,padx=290,singleline=True,tooltip="How many threads to use during image generation.\nIf left blank, uses same value as threads.")
     sd_model_var.trace("w", gui_changed_modelfile)
 
-    sdloritem1,sdloritem2,sdloritem3 = makefileentry(images_tab, "Image LoRA (Must be non-quant):", "Select SD lora file",sd_lora_var, 10, width=280, singlecol=False, filetypes=[("*.safetensors *.gguf", "*.safetensors *.gguf")],tooltiptxt="Select a .safetensors or .gguf SD LoRA model file to be loaded.")
-    sdloritem4,sdloritem5 = makelabelentry(images_tab, "Image LoRA Multiplier:" , sd_loramult_var, 12, 50,tooltip="What mutiplier value to apply the SD LoRA with.")
+    sdloritem1,sdloritem2,sdloritem3 = makefileentry(images_tab, "Image LoRA (Must be non-quant):", "Select SD lora file",sd_lora_var, 10, width=280, singlecol=True, filetypes=[("*.safetensors *.gguf", "*.safetensors *.gguf")],tooltiptxt="Select a .safetensors or .gguf SD LoRA model file to be loaded.")
+    sdloritem4,sdloritem5 = makelabelentry(images_tab, "Image LoRA Multiplier:" , sd_loramult_var, 12, 50,padx=290,singleline=True,tooltip="What mutiplier value to apply the SD LoRA with.")
     def togglesdquant(a,b,c):
         if sd_quant_var.get()==1:
             sdloritem1.grid_remove()
@@ -2886,25 +3067,31 @@ def show_gui():
             sdloritem4.grid_remove()
             sdloritem5.grid_remove()
         else:
-            sdloritem1.grid()
-            sdloritem2.grid()
-            sdloritem3.grid()
-            sdloritem4.grid()
-            sdloritem5.grid()
+            if not sdloritem1.grid_info() or not sdloritem2.grid_info() or not sdloritem3.grid_info() or not sdloritem4.grid_info() or not sdloritem5.grid_info():
+                sdloritem1.grid()
+                sdloritem2.grid()
+                sdloritem3.grid()
+                sdloritem4.grid()
+                sdloritem5.grid()
     makecheckbox(images_tab, "Compress Weights (Saves Memory)", sd_quant_var, 8,command=togglesdquant,tooltiptxt="Quantizes the SD model weights to save memory. May degrade quality.")
     sd_quant_var.trace("w", changed_gpulayers_estimate)
 
-    sdvaeitem1,sdvaeitem2,sdvaeitem3 = makefileentry(images_tab, "Image VAE:", "Select SD VAE file",sd_vae_var, 14, width=280, singlecol=False, filetypes=[("*.safetensors *.gguf", "*.safetensors *.gguf")],tooltiptxt="Select a .safetensors or .gguf SD VAE file to be loaded.")
+    makefileentry(images_tab, "T5-XXL File:", "Select Optional T5-XXL model file (SD3 or flux)",sd_t5xxl_var, 14, width=280, singlerow=True, filetypes=[("*.safetensors", "*.safetensors")],tooltiptxt="Select a .safetensors t5xxl file to be loaded.")
+    makefileentry(images_tab, "Clip-L File:", "Select Optional Clip-L model file (SD3 or flux)",sd_clipl_var, 16, width=280, singlerow=True, filetypes=[("*.safetensors", "*.safetensors")],tooltiptxt="Select a .safetensors t5xxl file to be loaded.")
+    makefileentry(images_tab, "Clip-G File:", "Select Optional Clip-G model file (SD3)",sd_clipg_var, 18, width=280, singlerow=True, filetypes=[("*.safetensors", "*.safetensors")],tooltiptxt="Select a .safetensors t5xxl file to be loaded.")
+
+    sdvaeitem1,sdvaeitem2,sdvaeitem3 = makefileentry(images_tab, "Image VAE:", "Select Optional SD VAE file",sd_vae_var, 20, width=280, singlerow=True, filetypes=[("*.safetensors *.gguf", "*.safetensors *.gguf")],tooltiptxt="Select a .safetensors or .gguf SD VAE file to be loaded.")
     def toggletaesd(a,b,c):
         if sd_vaeauto_var.get()==1:
             sdvaeitem1.grid_remove()
             sdvaeitem2.grid_remove()
             sdvaeitem3.grid_remove()
         else:
-            sdvaeitem1.grid()
-            sdvaeitem2.grid()
-            sdvaeitem3.grid()
-    makecheckbox(images_tab, "Use TAE SD (AutoFix Broken VAE)", sd_vaeauto_var, 16,command=toggletaesd,tooltiptxt="Replace VAE with TAESD. May fix bad VAE.")
+            if not sdvaeitem1.grid_info() or not sdvaeitem2.grid_info() or not sdvaeitem3.grid_info():
+                sdvaeitem1.grid()
+                sdvaeitem2.grid()
+                sdvaeitem3.grid()
+    makecheckbox(images_tab, "Use TAE SD (AutoFix Broken VAE)", sd_vaeauto_var, 22,command=toggletaesd,tooltiptxt="Replace VAE with TAESD. May fix bad VAE.")
 
     # audio tab
     audio_tab = tabcontent["Audio"]
@@ -2953,7 +3140,7 @@ def show_gui():
 
     # launch
     def guilaunch():
-        if model_var.get() == "" and sd_model_var.get() == "" and whisper_model_var.get() == "":
+        if model_var.get() == "" and sd_model_var.get() == "" and whisper_model_var.get() == "" and nomodel.get()!=1:
             tmp = askopenfilename(title="Select ggml model .bin or .gguf file")
             model_var.set(tmp)
         nonlocal nextstate
@@ -2973,21 +3160,28 @@ def show_gui():
         args.smartcontext = smartcontext.get()==1
         args.flashattention = flashattention.get()==1
         args.noshift = contextshift.get()==0
+        args.nofastforward = fastforward.get()==0
         args.remotetunnel = remotetunnel.get()==1
         args.foreground = keepforeground.get()==1
         args.quiet = quietmode.get()==1
         args.nocertify = nocertifymode.get()==1
+        args.nomodel = nomodel.get()==1
         if contextshift.get()==0 and flashattention.get()==1:
             args.quantkv = quantkv_var.get()
         else:
             args.quantkv = 0
 
         gpuchoiceidx = 0
+        args.usecpu = False
+        args.usevulkan = None
+        args.usecublas = None
+        args.useclblast = None
+        args.noavx2 = False
         if gpu_choice_var.get()!="All":
             gpuchoiceidx = int(gpu_choice_var.get())-1
-        if runopts_var.get() == "Use CLBlast" or runopts_var.get() == "CLBlast NoAVX2 (Old CPU)":
+        if runopts_var.get() == "Use CLBlast" or runopts_var.get() == "Use CLBlast (Old CPU)":
             args.useclblast = [[0,0], [1,0], [0,1], [1,1]][gpuchoiceidx]
-            if runopts_var.get() == "CLBlast NoAVX2 (Old CPU)":
+            if runopts_var.get() == "CUse CLBlast (Old CPU)":
                 args.noavx2 = True
         if runopts_var.get() == "Use CuBLAS" or runopts_var.get() == "Use hipBLAS (ROCm)":
             if gpu_choice_var.get()=="All":
@@ -2998,22 +3192,22 @@ def show_gui():
                 args.usecublas.append("mmq")
             if rowsplit_var.get()==1:
                 args.usecublas.append("rowsplit")
-        if runopts_var.get() == "Use Vulkan" or runopts_var.get() == "Vulkan NoAVX2 (Old CPU)":
+        if runopts_var.get() == "Use Vulkan" or runopts_var.get() == "Use Vulkan (Old CPU)":
             if gpu_choice_var.get()=="All":
                 args.usevulkan = []
             else:
                 args.usevulkan = [int(gpuchoiceidx)]
-            if runopts_var.get() == "Vulkan NoAVX2 (Old CPU)":
+            if runopts_var.get() == "Use Vulkan (Old CPU)":
                 args.noavx2 = True
         if gpulayers_var.get():
             args.gpulayers = int(gpulayers_var.get())
-        if runopts_var.get()=="Use No BLAS":
-            args.noblas = True
-        if runopts_var.get()=="NoAVX2 Mode (Old CPU)":
+        if runopts_var.get()=="Use CPU":
+            args.usecpu = True
+        if runopts_var.get()=="Use CPU (Old CPU)":
             args.noavx2 = True
         if runopts_var.get()=="Failsafe Mode (Old CPU)":
             args.noavx2 = True
-            args.noblas = True
+            args.usecpu = True
             args.nommap = True
         if tensor_split_str_vars.get()!="":
             tssv = tensor_split_str_vars.get()
@@ -3081,6 +3275,12 @@ def show_gui():
             args.sdvae = ""
             if sd_vae_var.get() != "":
                 args.sdvae = sd_vae_var.get()
+        if sd_t5xxl_var.get() != "":
+            args.sdt5xxl = sd_t5xxl_var.get()
+        if sd_clipl_var.get() != "":
+            args.sdclipl = sd_clipl_var.get()
+        if sd_clipg_var.get() != "":
+            args.sdclipg = sd_clipg_var.get()
         if sd_quant_var.get()==1:
             args.sdquant = True
             args.sdlora = ""
@@ -3110,10 +3310,12 @@ def show_gui():
         smartcontext.set(1 if "smartcontext" in dict and dict["smartcontext"] else 0)
         flashattention.set(1 if "flashattention" in dict and dict["flashattention"] else 0)
         contextshift.set(0 if "noshift" in dict and dict["noshift"] else 1)
+        fastforward.set(0 if "nofastforward" in dict and dict["nofastforward"] else 1)
         remotetunnel.set(1 if "remotetunnel" in dict and dict["remotetunnel"] else 0)
         keepforeground.set(1 if "foreground" in dict and dict["foreground"] else 0)
         quietmode.set(1 if "quiet" in dict and dict["quiet"] else 0)
         nocertifymode.set(1 if "nocertify" in dict and dict["nocertify"] else 0)
+        nomodel.set(1 if "nomodel" in dict and dict["nomodel"] else 0)
         if "quantkv" in dict:
             quantkv_var.set(dict["quantkv"])
         if "useclblast" in dict and dict["useclblast"]:
@@ -3157,17 +3359,15 @@ def show_gui():
                             gpu_choice_var.set(str(opt+1))
                             break
 
-        elif  "noavx2" in dict and "noblas" in dict and dict["noblas"] and dict["noavx2"]:
+        elif  "noavx2" in dict and "usecpu" in dict and dict["usecpu"] and dict["noavx2"]:
             if failsafe_option is not None:
                 runopts_var.set(failsafe_option)
         elif "noavx2" in dict and dict["noavx2"]:
             if noavx2_option is not None:
                 runopts_var.set(noavx2_option)
-        elif "noblas" in dict and dict["noblas"]:
+        elif "usecpu" in dict and dict["usecpu"]:
             if default_option is not None:
                 runopts_var.set(default_option)
-        elif openblas_option is not None:
-                runopts_var.set(openblas_option)
         if "gpulayers" in dict and dict["gpulayers"]:
             gpulayers_var.set(dict["gpulayers"])
         else:
@@ -3232,6 +3432,9 @@ def show_gui():
         sd_threads_var.set(str(dict["sdthreads"]) if ("sdthreads" in dict and dict["sdthreads"]) else str(default_threads))
         sd_quant_var.set(1 if ("sdquant" in dict and dict["sdquant"]) else 0)
         sd_vae_var.set(dict["sdvae"] if ("sdvae" in dict and dict["sdvae"]) else "")
+        sd_t5xxl_var.set(dict["sdt5xxl"] if ("sdt5xxl" in dict and dict["sdt5xxl"]) else "")
+        sd_clipl_var.set(dict["sdclipl"] if ("sdclipl" in dict and dict["sdclipl"]) else "")
+        sd_clipg_var.set(dict["sdclipg"] if ("sdclipg" in dict and dict["sdclipg"]) else "")
         sd_vaeauto_var.set(1 if ("sdvaeauto" in dict and dict["sdvaeauto"]) else 0)
         sd_lora_var.set(dict["sdlora"] if ("sdlora" in dict and dict["sdlora"]) else "")
         sd_loramult_var.set(str(dict["sdloramult"]) if ("sdloramult" in dict and dict["sdloramult"]) else "1.0")
@@ -3259,10 +3462,10 @@ def show_gui():
     def load_config_gui(): #this is used to populate the GUI with a config file, whereas load_config_cli simply overwrites cli args
         file_type = [("KoboldCpp Settings", "*.kcpps *.kcppt")]
         global runmode_untouched
-        runmode_untouched = False
         filename = askopenfilename(filetypes=file_type, defaultextension=file_type, initialdir=None)
         if not filename or filename=="":
             return
+        runmode_untouched = False
         with open(filename, 'r') as f:
             dict = json.load(f)
             import_vars(dict)
@@ -3272,6 +3475,12 @@ def show_gui():
         try:
             import webbrowser as wb
             wb.open("https://github.com/LostRuins/koboldcpp/wiki")
+        except:
+            print("Cannot launch help in browser.")
+    def display_help_models():
+        try:
+            import webbrowser as wb
+            wb.open("https://github.com/LostRuins/koboldcpp/wiki#what-models-does-koboldcpp-support-what-architectures-are-supported")
         except:
             print("Cannot launch help in browser.")
     def display_updates():
@@ -3292,6 +3501,11 @@ def show_gui():
     gpuinfo_thread = threading.Thread(target=auto_set_backend_gui)
     gpuinfo_thread.start() #submit job in new thread so nothing is waiting
 
+    if args.showgui:
+        if isinstance(args, argparse.Namespace):
+            dict = vars(args)
+            import_vars(dict)
+
     # runs main loop until closed or launch clicked
     root.mainloop()
 
@@ -3304,9 +3518,18 @@ def show_gui():
         kcpp_exporting_template = False
         export_vars()
 
-        if not args.model_param and not args.sdmodel and not args.whispermodel:
+        if not args.model_param and not args.sdmodel and not args.whispermodel and not args.nomodel:
             exitcounter = 999
-            exit_with_error(2,"No text or image model file was selected. Exiting.")
+            print("")
+            time.sleep(0.5)
+            if guimode:
+                givehelp = show_gui_yesnobox("No Model Loaded","No text or image model file was selected. Cannot continue.\n\nDo you want help finding a GGUF model?")
+                if givehelp == 'yes':
+                    display_help_models()
+            else:
+                print("No text or image model file was selected. Cannot continue.", flush=True)
+            time.sleep(2)
+            sys.exit(2)
 
 def show_gui_msgbox(title,message):
     print(title + ": " + message, flush=True)
@@ -3321,8 +3544,22 @@ def show_gui_msgbox(title,message):
     except Exception as ex2:
         pass
 
+def show_gui_yesnobox(title,message):
+    print(title + ": " + message, flush=True)
+    try:
+        from tkinter import messagebox
+        import tkinter as tk
+        root = tk.Tk()
+        root.attributes("-alpha", 0)
+        result = messagebox.askquestion(title=title, message=message,icon='error')
+        root.withdraw()
+        root.quit()
+        return result
+    except Exception as ex2:
+        return False
+        pass
+
 def print_with_time(txt):
-    from datetime import datetime
     print(f"{datetime.now().strftime('[%H:%M:%S]')} " + txt, flush=True)
 
 def make_url_request(url, data, method='POST', headers={}):
@@ -3344,7 +3581,7 @@ def make_url_request(url, data, method='POST', headers={}):
         else:
             request = urllib.request.Request(url, headers=headers, method=method)
         response_data = ""
-        with urllib.request.urlopen(request,context=ssl_context) as response:
+        with urllib.request.urlopen(request,context=ssl_context,timeout=300) as response:
             response_data = response.read().decode('utf-8',"ignore")
             json_response = json.loads(response_data)
             return json_response
@@ -3361,12 +3598,12 @@ def make_url_request(url, data, method='POST', headers={}):
 
 #A very simple and stripped down embedded horde worker with no dependencies
 def run_horde_worker(args, api_key, worker_name):
-    from datetime import datetime
     import random
-    global friendlymodelname, maxhordectx, maxhordelen, exitcounter, punishcounter, modelbusy, session_starttime
-    epurl = f"http://localhost:{args.port}"
+    global friendlymodelname, maxhordectx, maxhordelen, exitcounter, punishcounter, modelbusy, session_starttime, sslvalid
+    httpsaffix = ("https" if sslvalid else "http")
+    epurl = f"{httpsaffix}://localhost:{args.port}"
     if args.host!="":
-        epurl = f"http://{args.host}:{args.port}"
+        epurl = f"{httpsaffix}://{args.host}:{args.port}"
 
     def submit_completed_generation(url, jobid, sessionstart, submit_dict):
         global exitcounter, punishcounter, session_kudos_earned, session_jobs, rewardcounter
@@ -3392,8 +3629,11 @@ def run_horde_worker(args, api_key, worker_name):
                 if exitcounter > 1:
                     exitcounter -= 1
 
-    def make_url_request_horde(url, data, method='POST'):
+    def make_url_request_horde(url, data, method='POST',addmykey=False):
+        global password
         headers = headers = {"apikey": api_key,'User-Agent':'KoboldCppEmbeddedWorkerV2','Client-Agent':'KoboldCppEmbedWorker:2'}
+        if addmykey and password!="":
+            headers["Authorization"] = f"Bearer {password}"
         ret = make_url_request(url, data, method, headers)
         if not ret:
             print("Make sure your Horde API key and worker name is valid!")
@@ -3410,7 +3650,7 @@ def run_horde_worker(args, api_key, worker_name):
     cluster = "https://aihorde.net"
     while exitcounter < 10:
         time.sleep(3)
-        readygo = make_url_request_horde(f'{epurl}/api/v1/info/version', None,'GET')
+        readygo = make_url_request_horde(f'{epurl}/api/v1/info/version', None,'GET',addmykey=True)
         if readygo:
             print_with_time(f"Embedded Horde Worker '{worker_name}' is started.")
             break
@@ -3478,7 +3718,7 @@ def run_horde_worker(args, api_key, worker_name):
             if not modelbusy.locked():
                 #horde gets a genkey to avoid KCPP overlap
                 current_payload['genkey'] = f"HORDEREQ_{random.randint(100, 999)}"
-                current_generation = make_url_request_horde(f'{epurl}/api/v1/generate', current_payload)
+                current_generation = make_url_request_horde(f'{epurl}/api/v1/generate', current_payload, method='POST',addmykey=True)
                 if current_generation:
                     break
                 else:
@@ -3540,6 +3780,9 @@ def convert_outdated_args(args):
         if len(dict["hordeconfig"]) > 4:
             dict["hordekey"] = dict["hordeconfig"][3]
             dict["hordeworkername"] = dict["hordeconfig"][4]
+    if "noblas" in dict and dict["noblas"]:
+        dict["usecpu"] = True
+
     check_deprecation_warning()
     return args
 
@@ -3565,7 +3808,8 @@ def setuptunnel(has_sd):
     # It should work out of the box on both linux and windows
     try:
         import subprocess, re
-
+        global sslvalid
+        httpsaffix = ("https" if sslvalid else "http")
         def run_tunnel():
             tunnelproc = None
             tunneloutput = ""
@@ -3573,13 +3817,13 @@ def setuptunnel(has_sd):
             time.sleep(0.2)
             if os.name == 'nt':
                 print("Starting Cloudflare Tunnel for Windows, please wait...", flush=True)
-                tunnelproc = subprocess.Popen(f"cloudflared.exe tunnel --url localhost:{args.port}", text=True, encoding='utf-8', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                tunnelproc = subprocess.Popen(f"cloudflared.exe tunnel --url {httpsaffix}://localhost:{args.port}", text=True, encoding='utf-8', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             elif sys.platform=="darwin":
                 print("Starting Cloudflare Tunnel for MacOS, please wait...", flush=True)
-                tunnelproc = subprocess.Popen(f"./cloudflared tunnel --url http://localhost:{args.port}", text=True, encoding='utf-8', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                tunnelproc = subprocess.Popen(f"./cloudflared tunnel --url {httpsaffix}://localhost:{args.port}", text=True, encoding='utf-8', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             else:
                 print("Starting Cloudflare Tunnel for Linux, please wait...", flush=True)
-                tunnelproc = subprocess.Popen(f"./cloudflared-linux-amd64 tunnel --url http://localhost:{args.port}", text=True, encoding='utf-8', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                tunnelproc = subprocess.Popen(f"./cloudflared-linux-amd64 tunnel --url {httpsaffix}://localhost:{args.port}", text=True, encoding='utf-8', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             time.sleep(10)
             def tunnel_reader():
                 nonlocal tunnelproc,tunneloutput,tunnelrawlog
@@ -3710,8 +3954,13 @@ def load_config_cli(filename):
     with open(filename, 'r') as f:
         config = json.load(f)
         args.istemplate = False
+        raw_args = (sys.argv[1:]) #a lousy hack to allow for overriding kcpps
         for key, value in config.items():
-            setattr(args, key, value)
+            if f"--{key}" in raw_args:
+                if key!="config":
+                    print(f"Overriding Config Value: {key}")
+            else:
+                setattr(args, key, value)
         if args.istemplate:
             print("\nA .kcppt template was selected from CLI - automatically selecting your backend...")
             auto_set_backend_cli()
@@ -3751,7 +4000,7 @@ def sanitize_string(input_string):
     sanitized_string = re.sub( r'[^\w\d\.\-_]', '', input_string)
     return sanitized_string
 
-def download_model_from_url(url): #returns path to downloaded model when done
+def download_model_from_url_internal(url): #returns path to downloaded model when done
     import subprocess
     mdlfilename = os.path.basename(url)
     #check if file already exists
@@ -3768,13 +4017,26 @@ def download_model_from_url(url): #returns path to downloaded model when done
             print(f"Download {mdlfilename} completed.", flush=True)
             return mdlfilename
     return None
+def download_model_from_url(url,permitted_types=[".gguf",".safetensors"]):
+    if url and url!="":
+        if url.endswith("?download=true"):
+            url = url.replace("?download=true","")
+        end_ext_ok = False
+        for t in permitted_types:
+            if url.endswith(t):
+                end_ext_ok = True
+                break
+        if ((url.startswith("http://") or url.startswith("https://")) and end_ext_ok):
+            dlfile = download_model_from_url_internal(url)
+            return dlfile
+    return None
 
 def main(launch_args,start_server=True):
     global embedded_kailite, embedded_kcpp_docs, embedded_kcpp_sdui
     global libname, args, friendlymodelname, friendlysdmodelname, fullsdmodelpath, mmprojpath, password, fullwhispermodelpath
 
     args = launch_args
-    if (args.model_param or args.model) and args.prompt and not args.benchmark:
+    if (args.model_param or args.model) and args.prompt and not args.benchmark and not (args.debugmode >= 1):
         suppress_stdout()
 
     print(f"***\nWelcome to KoboldCpp - Version {KcppVersion}") # just update version manually
@@ -3792,10 +4054,8 @@ def main(launch_args,start_server=True):
 
     if args.config and len(args.config)==1:
         cfgname = args.config[0]
-        if cfgname.endswith("?download=true"):
-            cfgname = cfgname.replace("?download=true","")
-        if isinstance(cfgname, str) and (cfgname.startswith("http://") or cfgname.startswith("https://")) and (cfgname.endswith(".kcpps") or cfgname.endswith(".kcppt")):
-            dlfile = download_model_from_url(cfgname)
+        if isinstance(cfgname, str):
+            dlfile = download_model_from_url(cfgname,[".kcpps",".kcppt"])
             if dlfile:
                 cfgname = dlfile
         if isinstance(cfgname, str) and os.path.exists(cfgname):
@@ -3819,7 +4079,7 @@ def main(launch_args,start_server=True):
     if not args.model_param:
         args.model_param = args.model
 
-    if not args.model_param and not args.sdmodel and not args.whispermodel:
+    if args.showgui or (not args.model_param and not args.sdmodel and not args.whispermodel and not args.nomodel):
         #give them a chance to pick a file
         print("For command line arguments, please refer to --help")
         print("***")
@@ -3906,33 +4166,37 @@ def main(launch_args,start_server=True):
 
     # handle model downloads if needed
     if args.model_param and args.model_param!="":
-        if args.model_param.endswith("?download=true"):
-            args.model_param = args.model_param.replace("?download=true","")
-        if (args.model_param.startswith("http://") or args.model_param.startswith("https://")) and (args.model_param.endswith(".gguf") or args.model_param.endswith(".bin")):
-            dlfile = download_model_from_url(args.model_param)
-            if dlfile:
-                args.model_param = dlfile
+        dlfile = download_model_from_url(args.model_param,[".gguf",".bin"])
+        if dlfile:
+            args.model_param = dlfile
     if args.sdmodel and args.sdmodel!="":
-        if args.sdmodel.endswith("?download=true"):
-            args.sdmodel = args.sdmodel.replace("?download=true","")
-        if (args.sdmodel.startswith("http://") or args.sdmodel.startswith("https://")) and (args.sdmodel.endswith(".gguf") or args.sdmodel.endswith(".safetensors")):
-            dlfile = download_model_from_url(args.sdmodel)
-            if dlfile:
-                args.sdmodel = dlfile
+        dlfile = download_model_from_url(args.sdmodel,[".gguf",".safetensors"])
+        if dlfile:
+            args.sdmodel = dlfile
+    if args.sdt5xxl and args.sdt5xxl!="":
+        dlfile = download_model_from_url(args.sdt5xxl,[".safetensors"])
+        if dlfile:
+            args.sdt5xxl = dlfile
+    if args.sdclipl and args.sdclipl!="":
+        dlfile = download_model_from_url(args.sdclipl,[".safetensors"])
+        if dlfile:
+            args.sdclipl = dlfile
+    if args.sdclipg and args.sdclipg!="":
+        dlfile = download_model_from_url(args.sdclipg,[".safetensors"])
+        if dlfile:
+            args.sdclipg = dlfile
+    if args.sdvae and args.sdvae!="":
+        dlfile = download_model_from_url(args.sdvae,[".safetensors"])
+        if dlfile:
+            args.sdvae = dlfile
     if args.mmproj and args.mmproj!="":
-        if args.mmproj.endswith("?download=true"):
-            args.mmproj = args.mmproj.replace("?download=true","")
-        if (args.mmproj.startswith("http://") or args.mmproj.startswith("https://")) and (args.mmproj.endswith(".gguf")):
-            dlfile = download_model_from_url(args.mmproj)
-            if dlfile:
-                args.mmproj = dlfile
+        dlfile = download_model_from_url(args.mmproj,[".gguf"])
+        if dlfile:
+            args.mmproj = dlfile
     if args.whispermodel and args.whispermodel!="":
-        if args.whispermodel.endswith("?download=true"):
-            args.whispermodel = args.whispermodel.replace("?download=true","")
-        if (args.whispermodel.startswith("http://") or args.whispermodel.startswith("https://")) and (args.whispermodel.endswith(".gguf") or args.whispermodel.endswith(".bin")):
-            dlfile = download_model_from_url(args.whispermodel)
-            if dlfile:
-                args.whispermodel = dlfile
+        dlfile = download_model_from_url(args.whispermodel,[".gguf",".bin"])
+        if dlfile:
+            args.whispermodel = dlfile
 
     # sanitize and replace the default vanity name. remember me....
     if args.model_param and args.model_param!="":
@@ -3987,31 +4251,31 @@ def main(launch_args,start_server=True):
         nocertify = True
 
     if args.gpulayers:
-        global libname, lib_default, lib_openblas, lib_failsafe, lib_noavx2
-        nogood = [lib_default,lib_openblas,lib_failsafe,lib_noavx2]
         shouldavoidgpu = False
-        if libname in nogood and sys.platform!="darwin":
+        if args.usecpu and sys.platform!="darwin":
             shouldavoidgpu = True
-        if args.gpulayers>0:
-            if shouldavoidgpu:
-                print("WARNING: GPU layers is set, but a GPU backend was not selected!")
-                pass
-        elif args.gpulayers==-1 and not shouldavoidgpu and args.model_param and os.path.exists(args.model_param):
-            if not args.usecublas and not args.usevulkan and not args.useclblast:
-                print("NOTE: Auto GPU layers was set without picking a GPU backend! Trying to assign one for you automatically...")
+            if args.gpulayers and args.gpulayers>0:
+                print("WARNING: GPU layers is set, but a GPU backend was not selected! GPU will not be used!")
+            args.gpulayers = 0
+        elif args.gpulayers==-1 and sys.platform=="darwin" and args.model_param and os.path.exists(args.model_param):
+            print(f"MacOS detected: Auto GPU layers set to maximum")
+            args.gpulayers = 200
+        elif not shouldavoidgpu and args.model_param and os.path.exists(args.model_param):
+            if (args.usecublas is None) and (args.usevulkan is None) and (args.useclblast is None):
+                print("No GPU or CPU backend was selected. Trying to assign one for you automatically...")
                 auto_set_backend_cli()
-            print("Trying to automatically determine GPU layers...")
             if MaxMemory[0] == 0: #try to get gpu vram for cuda if not picked yet
                 fetch_gpu_properties(False,True,True)
                 pass
-            if MaxMemory[0] > 0:
-                extract_modelfile_params(args.model_param,args.sdmodel,args.whispermodel,args.mmproj)
-                layeramt = autoset_gpu_layers(args.contextsize,args.sdquant,args.blasbatchsize)
-                print(f"Auto Recommended Layers: {layeramt}")
-                args.gpulayers = layeramt
-            else:
-                print(f"Could not automatically determine layers. Please set it manually.")
-                args.gpulayers = 0
+            if args.gpulayers==-1:
+                if MaxMemory[0] > 0 and (not args.usecpu) and ((args.usecublas is not None) or (args.usevulkan is not None) or (args.useclblast is not None) or sys.platform=="darwin"):
+                    extract_modelfile_params(args.model_param,args.sdmodel,args.whispermodel,args.mmproj)
+                    layeramt = autoset_gpu_layers(args.contextsize,args.sdquant,args.blasbatchsize)
+                    print(f"Auto Recommended GPU Layers: {layeramt}")
+                    args.gpulayers = layeramt
+                else:
+                    print(f"No GPU backend found, or could not automatically determine GPU layers. Please set it manually.")
+                    args.gpulayers = 0
 
     if args.threads == -1:
         args.threads = get_default_threads()
@@ -4097,6 +4361,9 @@ def main(launch_args,start_server=True):
         else:
             imglora = ""
             imgvae = ""
+            imgt5xxl = ""
+            imgclipl = ""
+            imgclipg = ""
             if args.sdlora:
                 if os.path.exists(args.sdlora):
                     imglora = os.path.abspath(args.sdlora)
@@ -4107,13 +4374,28 @@ def main(launch_args,start_server=True):
                     imgvae = os.path.abspath(args.sdvae)
                 else:
                     print(f"Missing SD VAE model file...")
+            if args.sdt5xxl:
+                if os.path.exists(args.sdt5xxl):
+                    imgt5xxl = os.path.abspath(args.sdt5xxl)
+                else:
+                    print(f"Missing SD T5-XXL model file...")
+            if args.sdclipl:
+                if os.path.exists(args.sdclipl):
+                    imgclipl = os.path.abspath(args.sdclipl)
+                else:
+                    print(f"Missing SD Clip-L model file...")
+            if args.sdclipg:
+                if os.path.exists(args.sdclipg):
+                    imgclipg = os.path.abspath(args.sdclipg)
+                else:
+                    print(f"Missing SD Clip-G model file...")
 
             imgmodel = os.path.abspath(imgmodel)
             fullsdmodelpath = imgmodel
             friendlysdmodelname = os.path.basename(imgmodel)
             friendlysdmodelname = os.path.splitext(friendlysdmodelname)[0]
             friendlysdmodelname = sanitize_string(friendlysdmodelname)
-            loadok = sd_load_model(imgmodel,imgvae,imglora)
+            loadok = sd_load_model(imgmodel,imgvae,imglora,imgt5xxl,imgclipl,imgclipg)
             print("Load Image Model OK: " + str(loadok))
             if not loadok:
                 exitcounter = 999
@@ -4141,7 +4423,7 @@ def main(launch_args,start_server=True):
 
     #load embedded lite
     try:
-        basepath = os.path.abspath(os.path.dirname(__file__))
+        basepath = os.path.abspath(os.path.dirname(os.path.realpath(__file__)))
         with open(os.path.join(basepath, "klite.embd"), mode='rb') as f:
             embedded_kailite = f.read()
             # patch it with extra stuff
@@ -4155,7 +4437,7 @@ def main(launch_args,start_server=True):
         print("Could not find KoboldAI Lite. Embedded KoboldAI Lite will not be available.")
 
     try:
-        basepath = os.path.abspath(os.path.dirname(__file__))
+        basepath = os.path.abspath(os.path.dirname(os.path.realpath(__file__)))
         with open(os.path.join(basepath, "kcpp_docs.embd"), mode='rb') as f:
             embedded_kcpp_docs = f.read()
             print("Embedded API docs loaded.")
@@ -4163,7 +4445,7 @@ def main(launch_args,start_server=True):
         print("Could not find Embedded KoboldCpp API docs.")
 
     try:
-        basepath = os.path.abspath(os.path.dirname(__file__))
+        basepath = os.path.abspath(os.path.dirname(os.path.realpath(__file__)))
         with open(os.path.join(basepath, "kcpp_sdui.embd"), mode='rb') as f:
             embedded_kcpp_sdui = f.read()
             if args.sdmodel:
@@ -4218,7 +4500,6 @@ def main(launch_args,start_server=True):
         timer_thread.start()
 
     if args.model_param and (args.benchmark or args.prompt):
-        from datetime import datetime, timezone
         start_server = False
         save_to_file = (args.benchmark and args.benchmark!="stdout" and args.benchmark!="")
         benchmaxctx = maxctx
@@ -4269,7 +4550,7 @@ def main(launch_args,start_server=True):
             s_pp = float(benchmaxctx-benchlen)/t_pp
             s_gen = float(benchlen)/t_gen
             datetimestamp = datetime.now(timezone.utc)
-            benchflagstr = f"NoAVX2={args.noavx2} Threads={args.threads} HighPriority={args.highpriority} NoBlas={args.noblas} Cublas_Args={args.usecublas} Tensor_Split={args.tensor_split} BlasThreads={args.blasthreads} BlasBatchSize={args.blasbatchsize} FlashAttention={args.flashattention} KvCache={args.quantkv}"
+            benchflagstr = f"NoAVX2={args.noavx2} Threads={args.threads} HighPriority={args.highpriority} Cublas_Args={args.usecublas} Tensor_Split={args.tensor_split} BlasThreads={args.blasthreads} BlasBatchSize={args.blasbatchsize} FlashAttention={args.flashattention} KvCache={args.quantkv}"
             print(f"\nBenchmark Completed - v{KcppVersion} Results:\n======")
             print(f"Flags: {benchflagstr}")
             print(f"Timestamp: {datetimestamp}")
@@ -4347,7 +4628,7 @@ if __name__ == '__main__':
             return f
         return range_checker
 
-    parser = argparse.ArgumentParser(description='KoboldCpp Server')
+    parser = argparse.ArgumentParser(description=f'KoboldCpp Server - Version {KcppVersion}')
     modelgroup = parser.add_mutually_exclusive_group() #we want to be backwards compatible with the unnamed positional args
     modelgroup.add_argument("--model", metavar=('[filename]'), help="Model file to load", type=str, default="")
     modelgroup.add_argument("model_param", help="Model file to load (positional)", nargs="?")
@@ -4363,9 +4644,9 @@ if __name__ == '__main__':
     compatgroup.add_argument("--usecublas", help="Use CuBLAS for GPU Acceleration. Requires CUDA. Select lowvram to not allocate VRAM scratch buffer. Enter a number afterwards to select and use 1 GPU. Leaving no number will use all GPUs. For hipBLAS binaries, please check YellowRoseCx rocm fork.", nargs='*',metavar=('[lowvram|normal] [main GPU ID] [mmq] [rowsplit]'), choices=['normal', 'lowvram', '0', '1', '2', '3', 'mmq', 'rowsplit'])
     compatgroup.add_argument("--usevulkan", help="Use Vulkan for GPU Acceleration. Can optionally specify GPU Device ID (e.g. --usevulkan 0).", metavar=('[Device ID]'), nargs='*', type=int, default=None)
     compatgroup.add_argument("--useclblast", help="Use CLBlast for GPU Acceleration. Must specify exactly 2 arguments, platform ID and device ID (e.g. --useclblast 1 0).", type=int, choices=range(0,9), nargs=2)
-    compatgroup.add_argument("--noblas", help="Do not use any accelerated prompt ingestion", action='store_true')
+    compatgroup.add_argument("--usecpu", help="Do not use any GPU acceleration (CPU Only)", action='store_true')
     parser.add_argument("--contextsize", help="Controls the memory allocated for maximum context size, only change if you need more RAM for big contexts. (default 4096). Supported values are [256,512,1024,2048,3072,4096,6144,8192,12288,16384,24576,32768,49152,65536,98304,131072]. IF YOU USE ANYTHING ELSE YOU ARE ON YOUR OWN.",metavar=('[256,512,1024,2048,3072,4096,6144,8192,12288,16384,24576,32768,49152,65536,98304,131072]'), type=check_range(int,256,262144), default=4096)
-    parser.add_argument("--gpulayers", help="Set number of layers to offload to GPU when using GPU. Requires GPU. Set to -1 to try autodetect (experimental)",metavar=('[GPU layers]'), nargs='?', const=1, type=int, default=0)
+    parser.add_argument("--gpulayers", help="Set number of layers to offload to GPU when using GPU. Requires GPU. Set to -1 to try autodetect, set to 0 to disable GPU offload.",metavar=('[GPU layers]'), nargs='?', const=1, type=int, default=-1)
     parser.add_argument("--tensor_split", help="For CUDA and Vulkan only, ratio to split tensors across multiple GPUs, space-separated list of proportions, e.g. 7 3", metavar=('[Ratios]'), type=float, nargs='+')
 
     #more advanced params
@@ -4375,11 +4656,11 @@ if __name__ == '__main__':
     advparser.add_argument("--blasthreads", help="Use a different number of threads during BLAS if specified. Otherwise, has the same value as --threads",metavar=('[threads]'), type=int, default=0)
     advparser.add_argument("--lora", help="LLAMA models only, applies a lora file on top of model. Experimental.", metavar=('[lora_filename]', '[lora_base]'), nargs='+')
     advparser.add_argument("--noshift", help="If set, do not attempt to Trim and Shift the GGUF context.", action='store_true')
+    advparser.add_argument("--nofastforward", help="If set, do not attempt to fast forward GGUF context (always reprocess). Will also enable noshift", action='store_true')
     advparser.add_argument("--nommap", help="If set, do not use mmap to load newer models", action='store_true')
     advparser.add_argument("--usemlock", help="Enables mlock, preventing the RAM used to load the model from being paged out. Not usually recommended.", action='store_true')
     advparser.add_argument("--noavx2", help="Do not use AVX2 instructions, a slower compatibility mode for older devices.", action='store_true')
     advparser.add_argument("--debugmode", help="Shows additional debug info in the terminal.", nargs='?', const=1, type=int, default=0)
-    advparser.add_argument("--skiplauncher", help="Doesn't display or use the GUI launcher.", action='store_true')
     advparser.add_argument("--onready", help="An optional shell command to execute after the model has been loaded.", metavar=('[shell command]'), type=str, default="",nargs=1)
     advparser.add_argument("--benchmark", help="Do not start server, instead run benchmarks. If filename is provided, appends results to provided file.", metavar=('[filename]'), nargs='?', const="stdout", type=str, default=None)
     advparser.add_argument("--prompt", metavar=('[prompt]'), help="Passing a prompt string triggers a direct inference, loading the model, outputs the response to stdout and exits. Can be used alone or with benchmark.", type=str, default="")
@@ -4392,7 +4673,7 @@ if __name__ == '__main__':
     advparser.add_argument("--quiet", help="Enable quiet mode, which hides generation inputs and outputs in the terminal. Quiet mode is automatically enabled when running a horde worker.", action='store_true')
     advparser.add_argument("--ssl", help="Allows all content to be served over SSL instead. A valid UNENCRYPTED SSL cert and key .pem files must be provided", metavar=('[cert_pem]', '[key_pem]'), nargs='+')
     advparser.add_argument("--nocertify", help="Allows insecure SSL connections. Use this if you have cert errors and need to bypass certificate restrictions.", action='store_true')
-    advparser.add_argument("--mmproj", help="Select a multimodal projector file for LLaVA.", default="")
+    advparser.add_argument("--mmproj", help="Select a multimodal projector file for vision models like LLaVA.", default="")
     advparser.add_argument("--password", help="Enter a password required to use this instance. This key will be required for all text endpoints. Image endpoints are not secured.", default=None)
     advparser.add_argument("--ignoremissing", help="Ignores all missing non-essential files, just skipping them instead.", action='store_true')
     advparser.add_argument("--chatcompletionsadapter", help="Select an optional ChatCompletions Adapter JSON file to force custom instruct tags.", default="")
@@ -4401,7 +4682,10 @@ if __name__ == '__main__':
     advparser.add_argument("--forceversion", help="If the model file format detection fails (e.g. rogue modified model) you can set this to override the detected format (enter desired version, e.g. 401 for GPTNeoX-Type2).",metavar=('[version]'), type=int, default=0)
     advparser.add_argument("--smartcontext", help="Reserving a portion of context to try processing less frequently. Outdated. Not recommended.", action='store_true')
     advparser.add_argument("--unpack", help="Extracts the file contents of the KoboldCpp binary into a target directory.", metavar=('destination'), type=str, default="")
-
+    advparser.add_argument("--nomodel", help="Allows you to launch the GUI alone, without selecting any model.", action='store_true')
+    compatgroup2 = parser.add_mutually_exclusive_group()
+    compatgroup2.add_argument("--showgui", help="Always show the GUI instead of launching the model right away when loading settings from a .kcpps file.", action='store_true')
+    compatgroup2.add_argument("--skiplauncher", help="Doesn't display or use the GUI launcher.", action='store_true')
 
     hordeparsergroup = parser.add_argument_group('Horde Worker Commands')
     hordeparsergroup.add_argument("--hordemodelname", metavar=('[name]'), help="Sets your AI Horde display model name.", default="")
@@ -4414,6 +4698,9 @@ if __name__ == '__main__':
     sdparsergroup.add_argument("--sdmodel", metavar=('[filename]'), help="Specify a stable diffusion safetensors or gguf model to enable image generation.", default="")
     sdparsergroup.add_argument("--sdthreads", metavar=('[threads]'), help="Use a different number of threads for image generation if specified. Otherwise, has the same value as --threads.", type=int, default=0)
     sdparsergroup.add_argument("--sdclamped", help="If specified, limit generation steps and resolution settings for shared use. Accepts an extra optional parameter that indicates maximum resolution (eg. 768 clamps to 768x768, min 512px, disabled if 0).", nargs='?', const=512, type=int, default=0)
+    sdparsergroup.add_argument("--sdt5xxl", metavar=('[filename]'), help="Specify a T5-XXL safetensors model for use in SD3 or Flux. Leave blank if prebaked or unused.", default="")
+    sdparsergroup.add_argument("--sdclipl", metavar=('[filename]'), help="Specify a Clip-L safetensors model for use in SD3 or Flux. Leave blank if prebaked or unused.", default="")
+    sdparsergroup.add_argument("--sdclipg", metavar=('[filename]'), help="Specify a Clip-G safetensors model for use in SD3. Leave blank if prebaked or unused.", default="")
     sdparsergroupvae = sdparsergroup.add_mutually_exclusive_group()
     sdparsergroupvae.add_argument("--sdvae", metavar=('[filename]'), help="Specify a stable diffusion safetensors VAE which replaces the one in the model.", default="")
     sdparsergroupvae.add_argument("--sdvaeauto", help="Uses a built-in VAE via TAE SD, which is very fast, and fixed bad VAEs.", action='store_true')
@@ -4428,5 +4715,6 @@ if __name__ == '__main__':
     deprecatedgroup = parser.add_argument_group('Deprecated Commands, DO NOT USE!')
     deprecatedgroup.add_argument("--hordeconfig", help=argparse.SUPPRESS, nargs='+')
     deprecatedgroup.add_argument("--sdconfig", help=argparse.SUPPRESS, nargs='+')
+    compatgroup.add_argument("--noblas", help=argparse.SUPPRESS, action='store_true')
 
     main(parser.parse_args(),start_server=True)

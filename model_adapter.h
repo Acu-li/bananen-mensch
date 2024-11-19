@@ -58,6 +58,7 @@ enum GGUFArch
     ARCH_MAMBA = 3,
     ARCH_SOLAR = 4,
     ARCH_QWEN2 = 5,
+    ARCH_RWKV = 6,
 };
 
 struct FileFormatExtraMeta
@@ -66,6 +67,18 @@ struct FileFormatExtraMeta
     int fileversion = 0;
     GGUFArch model_architecture = GGUFArch::ARCH_DEFAULT;
     int n_expert_count = 0;
+};
+
+struct TopPicksData
+{
+    std::string selected_token;
+    int32_t selected_tokenid;
+    float selected_logprob;
+    float selected_probability;
+    std::vector<std::string> tokens;
+    std::vector<int> tokenid;
+    std::vector<float> logprobs;
+    std::vector<float> p;
 };
 
 enum ModelLoadResult
@@ -80,6 +93,7 @@ generation_outputs gpttype_generate(const generation_inputs inputs);
 bool gpttype_generate_abort();
 const std::string & gpttype_get_pending_output();
 std::vector<int> gpttype_get_token_arr(const std::string & input, bool addbos);
+const std::vector<TopPicksData> gpttype_get_top_picks_data();
 
 bool sdtype_load_model(const sd_load_model_inputs inputs);
 sd_generation_outputs sdtype_generate(const sd_generation_inputs inputs);

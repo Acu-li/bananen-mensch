@@ -21,6 +21,7 @@
 #endif
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
@@ -163,7 +164,7 @@ static bool ggml_graph_compute_helper(
                          int   n_threads,
          ggml_abort_callback   abort_callback,
                         void * abort_callback_data) {
-    struct ggml_cplan plan = ggml_graph_plan(graph, n_threads);
+    struct ggml_cplan plan = ggml_graph_plan(graph, n_threads, nullptr);
 
     plan.abort_callback      = abort_callback;
     plan.abort_callback_data = abort_callback_data;
@@ -183,11 +184,11 @@ static bool ggml_graph_compute_helper(
     if (ggml_backend_is_cpu(backend)) {
         ggml_backend_cpu_set_n_threads(backend, n_threads);
     }
-#ifdef GGML_USE_METAL
-    if (ggml_backend_is_metal(backend)) {
-        ggml_backend_metal_set_n_cb(backend, n_threads);
-    }
-#endif
+// #ifdef GGML_USE_METAL
+//     if (ggml_backend_is_metal(backend)) {
+//         ggml_backend_metal_set_n_cb(backend, n_threads);
+//     }
+// #endif
     return ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS;
 }
 
@@ -1240,7 +1241,6 @@ static ggml_backend_t whisper_backend_init(const whisper_context_params & params
 #ifdef GGML_USE_METAL
     if (params.use_gpu) {
         WHISPER_LOG_INFO("%s: using Metal backend\n", __func__);
-        ggml_backend_metal_log_set_callback(g_state.log_callback, g_state.log_callback_user_data);
         backend_gpu = ggml_backend_metal_init();
         if (!backend_gpu) {
             WHISPER_LOG_ERROR("%s: ggml_backend_metal_init() failed\n", __func__);
@@ -2008,7 +2008,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                             ggml_element_size(kv_pad.v)*n_state_head,
                             0);
 
-                cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, KQscale, 0.0f);
+                cur = ggml_flash_attn_ext(ctx0, Q, K, V, nullptr, KQscale, 0.0f, 0.0f);
 
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx);
             } else {
@@ -2471,7 +2471,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                             ggml_element_size(kv_self.v)*n_state_head,
                             ggml_element_size(kv_self.v)*n_state*n_ctx*il);
 
-                cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask_f16, 1.0f, 0.0f);
+                cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask_f16, 1.0f, 0.0f, 0.0f);
 
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_tokens);
             } else {
@@ -2553,7 +2553,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                             ggml_element_size(wstate.kv_cross.v)*n_state_head,
                             ggml_element_size(wstate.kv_cross.v)*n_state*n_audio_ctx_pad*il);
 
-                cur = ggml_flash_attn_ext(ctx0, Q, Kcross, Vcross, nullptr, KQscale, 0.0f);
+                cur = ggml_flash_attn_ext(ctx0, Q, Kcross, Vcross, nullptr, KQscale, 0.0f, 0.0f);
 
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_tokens);
             } else {
@@ -2802,7 +2802,7 @@ static bool whisper_decode_internal(
             ggml_backend_tensor_set(KQ_mask, wstate.inp_mask.data(), 0, ggml_nelements(KQ_mask)*sizeof(float));
         }
 
-        logits = gf->nodes[gf->n_nodes - 1];
+        logits = ggml_graph_node(gf, -1);
 
         if (!ggml_graph_compute_helper(wstate.backend, gf, n_threads)) {
             return false;

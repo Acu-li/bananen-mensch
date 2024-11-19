@@ -97,7 +97,7 @@
                          },
                          "temperature": {
                             "description": "Temperature value.",
-                            "exclusiveMinimum": 0,
+                            "minimum": 0,
                             "type": "number"
                          },
                          "tfs": {
@@ -142,13 +142,13 @@
                          "dynatemp_range": {
                             "default": 0,
                             "description": "If greater than 0, uses dynamic temperature. Dynamic temperature range will be between Temp+Range and Temp-Range. If less or equal to 0 , uses static temperature.",
-                            "exclusiveMinimum": 0,
+                            "minimum": 0,
                             "type": "number"
                          },
                          "smoothing_factor": {
                             "default": 0,
                              "description": "Modifies temperature behavior. If greater than 0 uses smoothing factor.",
-                             "exclusiveMinimum": 0,
+                             "minimum": 0,
                              "type": "number"
                          },
                          "dynatemp_exponent": {
@@ -164,12 +164,12 @@
                          },
                          "mirostat_tau": {
                             "description": "KoboldCpp ONLY. Mirostat tau value.",
-                            "exclusiveMinimum": 0,
+                            "minimum": 0,
                             "type": "number"
                          },
                          "mirostat_eta": {
                             "description": "KoboldCpp ONLY. Mirostat eta value.",
-                            "exclusiveMinimum": 0,
+                            "minimum": 0,
                             "type": "number"
                          },
                          "genkey": {
@@ -191,7 +191,10 @@
                          },
                          "images": {
                             "description": "KoboldCpp ONLY. If set, takes an array of base64 encoded strings, each one representing an image to be processed.",
-                            "type": "array"
+                            "type": "array",
+                            "items": {
+                               "type": "string"
+                            }
                          },
                          "trim_stop": {
                             "default": false,
@@ -209,7 +212,7 @@
                             "type": "boolean"
                          },
                          "banned_tokens": {
-                            "description": "An array of string sequences to remove from model vocab. All matching tokens with matching substrings are removed.",
+                            "description": "An array of string sequences, each entry represents a word or phrase prevented from being generated, either modifying model vocab or by backtracking and regenerating when they appear.",
                             "items": {
                                "type": "string"
                             },
@@ -227,17 +230,17 @@
                          },
                          "dry_multiplier": {
                             "description": "KoboldCpp ONLY. DRY multiplier value, 0 to disable.",
-                            "exclusiveMinimum": 0,
+                            "minimum": 0,
                             "type": "number"
                          },
                          "dry_base": {
                             "description": "KoboldCpp ONLY. DRY base value.",
-                            "exclusiveMinimum": 0,
+                            "minimum": 0,
                             "type": "number"
                          },
                          "dry_allowed_length": {
                             "description": "KoboldCpp ONLY. DRY allowed length value.",
-                            "exclusiveMinimum": 0,
+                            "minimum": 0,
                             "type": "number"
                          },
                          "dry_sequence_breakers": {
@@ -246,6 +249,21 @@
                                "type": "string"
                             },
                             "type": "array"
+                         },
+                         "xtc_threshold": {
+                            "description": "KoboldCpp ONLY. XTC threshold.",
+                            "minimum": 0,
+                            "type": "number"
+                         },
+                         "xtc_probability": {
+                            "description": "KoboldCpp ONLY. XTC probability. Set to above 0 to enable XTC.",
+                            "minimum": 0,
+                            "type": "number"
+                         },
+                         "logprobs": {
+                            "default": false,
+                            "description": "If true, return up to 5 top logprobs for generated tokens. Incurs performance overhead.",
+                            "type": "boolean"
                          },
                       },
                       "required": [
@@ -798,6 +816,215 @@
                       ]
                    }
                 },
+                "/api/extra/last_logprobs": {
+                   "post": {
+                      "description": "Obtains the token logprobs of the most recent request. A unique genkey previously submitted is required in multiuser mode.",
+                      "requestBody": {
+                         "content": {
+                            "application/json": {
+                               "example": {
+                                  "genkey": "KCPP2342"
+                               },
+                               "schema": {
+                                  "properties": {
+                                     "genkey": {
+                                        "type": "string",
+                                        "description": "A unique key used to identify the previous generation."
+                                     }
+                                  },
+                                  "type": "object"
+                               }
+                            }
+                         },
+                         "required": false
+                      },
+                      "responses": {
+                         "200": {
+                            "content": {
+                               "application/json": {
+                                  "example": {
+                                     "logprobs": {
+                                       "content": [
+                                          {
+                                             "token": "Hello",
+                                             "logprob": -0.31725305,
+                                             "bytes": [72, 101, 108, 108, 111],
+                                             "top_logprobs": [
+                                             {
+                                                "token": "Hello",
+                                                "logprob": -0.31725305,
+                                                "bytes": [72, 101, 108, 108, 111]
+                                             },
+                                             {
+                                                "token": "Hi",
+                                                "logprob": -1.3190403,
+                                                "bytes": [72, 105]
+                                             }
+                                             ]
+                                          },
+                                          {
+                                             "token": "!",
+                                             "logprob": -0.02380986,
+                                             "bytes": [
+                                             33
+                                             ],
+                                             "top_logprobs": [
+                                             {
+                                                "token": "!",
+                                                "logprob": -0.02380986,
+                                                "bytes": [33]
+                                             },
+                                             {
+                                                "token": " there",
+                                                "logprob": -3.787621,
+                                                "bytes": [32, 116, 104, 101, 114, 101]
+                                             }
+                                             ]
+                                          },
+                                          {
+                                             "token": " How",
+                                             "logprob": -0.000054669687,
+                                             "bytes": [32, 72, 111, 119],
+                                             "top_logprobs": [
+                                             {
+                                                "token": " How",
+                                                "logprob": -0.000054669687,
+                                                "bytes": [32, 72, 111, 119]
+                                             },
+                                             {
+                                                "token": "<|end|>",
+                                                "logprob": -10.953937,
+                                                "bytes": null
+                                             }
+                                             ]
+                                          },
+                                          {
+                                             "token": " can",
+                                             "logprob": -0.015801601,
+                                             "bytes": [32, 99, 97, 110],
+                                             "top_logprobs": [
+                                             {
+                                                "token": " can",
+                                                "logprob": -0.015801601,
+                                                "bytes": [32, 99, 97, 110]
+                                             },
+                                             {
+                                                "token": " may",
+                                                "logprob": -4.161023,
+                                                "bytes": [32, 109, 97, 121]
+                                             }
+                                             ]
+                                          },
+                                          {
+                                             "token": " I",
+                                             "logprob": -3.7697225e-6,
+                                             "bytes": [
+                                             32,
+                                             73
+                                             ],
+                                             "top_logprobs": [
+                                             {
+                                                "token": " I",
+                                                "logprob": -3.7697225e-6,
+                                                "bytes": [32, 73]
+                                             },
+                                             {
+                                                "token": " assist",
+                                                "logprob": -13.596657,
+                                                "bytes": [32, 97, 115, 115, 105, 115, 116]
+                                             }
+                                             ]
+                                          },
+                                          {
+                                             "token": " assist",
+                                             "logprob": -0.04571125,
+                                             "bytes": [32, 97, 115, 115, 105, 115, 116],
+                                             "top_logprobs": [
+                                             {
+                                                "token": " assist",
+                                                "logprob": -0.04571125,
+                                                "bytes": [32, 97, 115, 115, 105, 115, 116]
+                                             },
+                                             {
+                                                "token": " help",
+                                                "logprob": -3.1089056,
+                                                "bytes": [32, 104, 101, 108, 112]
+                                             }
+                                             ]
+                                          },
+                                          {
+                                             "token": " you",
+                                             "logprob": -5.4385737e-6,
+                                             "bytes": [32, 121, 111, 117],
+                                             "top_logprobs": [
+                                             {
+                                                "token": " you",
+                                                "logprob": -5.4385737e-6,
+                                                "bytes": [32, 121, 111, 117]
+                                             },
+                                             {
+                                                "token": " today",
+                                                "logprob": -12.807695,
+                                                "bytes": [32, 116, 111, 100, 97, 121]
+                                             }
+                                             ]
+                                          },
+                                          {
+                                             "token": " today",
+                                             "logprob": -0.0040071653,
+                                             "bytes": [32, 116, 111, 100, 97, 121],
+                                             "top_logprobs": [
+                                             {
+                                                "token": " today",
+                                                "logprob": -0.0040071653,
+                                                "bytes": [32, 116, 111, 100, 97, 121]
+                                             },
+                                             {
+                                                "token": "?",
+                                                "logprob": -5.5247097,
+                                                "bytes": [63]
+                                             }
+                                             ]
+                                          },
+                                          {
+                                             "token": "?",
+                                             "logprob": -0.0008108172,
+                                             "bytes": [63],
+                                             "top_logprobs": [
+                                             {
+                                                "token": "?",
+                                                "logprob": -0.0008108172,
+                                                "bytes": [63]
+                                             },
+                                             {
+                                                "token": "?\n",
+                                                "logprob": -7.184561,
+                                                "bytes": [63, 10]
+                                             }
+                                             ]
+                                          }
+                                       ]
+                                    }
+                                  },
+                                  "schema": {
+                                     "properties": {
+                                        "logprobs": {
+                                           "type": "object",
+                                           "description": "A logprobs object in the same format as OpenAI API."
+                                        }
+                                     }
+                                  }
+                               }
+                            },
+                            "description": "Successful request"
+                         }
+                      },
+                      "summary": "Obtains the token logprobs of the most recent request.",
+                      "tags": [
+                         "api/extra"
+                      ]
+                   }
+                },
                 "/api/extra/tokencount": {
                    "post": {
                       "description": "Counts the number of tokens in a string.",
@@ -944,6 +1171,29 @@
                       ]
                    }
                 },
+                "/.well-known/serviceinfo": {
+                   "get": {
+                      "responses": {
+                         "200": {
+                            "content": {
+                               "application/json": {
+                                  "example": {"version":"0.2","software":{"name":"KoboldCpp","version":1.77,"repository":"https://github.com/LostRuins/koboldcpp","homepage":"https://github.com/LostRuins/koboldcpp","logo":"https://raw.githubusercontent.com/LostRuins/koboldcpp/refs/heads/concedo/niko.ico"},"api":{"koboldai":{"name":"KoboldAI API","rel_url":"/api","documentation":"https://lite.koboldai.net/koboldcpp_api","version":1.77},"openai":{"name":"OpenAI API","rel_url ":"/v1","documentation":"https://openai.com/documentation/api","version":1.77}}},
+                                  "schema": {
+                                    "properties": {},
+                                    "type": "object"
+                                 }
+                               }
+                            },
+                            "description": "Successful request"
+                         }
+                      },
+                      "description": "Retrieve the common API identity provider",
+                      "summary": "Retrieve the common API identity provider",
+                      "tags": [
+                         "serviceinfo"
+                      ]
+                   }
+                },
                 "/sdapi/v1/sd-models": {
                    "get": {
                       "description": "Gets a list of image generation models. For koboldcpp, only one model will be returned. If no model is loaded, the list is empty.",
@@ -1022,6 +1272,7 @@
                                   "width": 512,
                                   "height": 512,
                                   "seed": -1,
+                                  "clip_skip": -1,
                                   "sampler_name": "Euler a"
                                },
                                "schema": {
@@ -1045,6 +1296,9 @@
                                         "type": "number"
                                      },
                                      "seed": {
+                                        "type": "number"
+                                     },
+                                     "clip_skip": {
                                         "type": "number"
                                      },
                                      "sampler_name": {
@@ -1106,6 +1360,7 @@
                                   "width": 512,
                                   "height": 512,
                                   "seed": -1,
+                                  "clip_skip": -1,
                                   "sampler_name": "Euler a",
                                   "denoising_strength": 0.6,
                                   "init_images":["base64_image_data"],
@@ -1133,6 +1388,9 @@
                                      "seed": {
                                         "type": "number"
                                      },
+                                     "clip_skip": {
+                                        "type": "number"
+                                     },
                                      "sampler_name": {
                                         "type": "string"
                                      },
@@ -1140,7 +1398,10 @@
                                         "type": "number"
                                      },
                                      "init_images": {
-                                        "type": "array"
+                                        "type": "array",
+                                        "items": {
+                                          "type": "string"
+                                       }
                                      },
                                   },
                                   "type": "object"
@@ -1244,7 +1505,8 @@
                       "description": "Generates text continuations given a prompt.\n\nThis is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/completions](https://platform.openai.com/docs/api-reference/completions)",
                       "tags": [
                          "v1"
-                      ]
+                      ],
+                      "responses": {"default": {"description": ""}}
                    }
                 },
                 "/v1/chat/completions": {
@@ -1253,7 +1515,8 @@
                       "description": "Given a list of messages comprising a conversation, the model will return a response.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/chat](https://platform.openai.com/docs/api-reference/chat)",
                       "tags": [
                          "v1"
-                      ]
+                      ],
+                      "responses": {"default": {"description": ""}}
                    }
                 },
                 "/v1/models": {
@@ -1262,7 +1525,8 @@
                       "description": "List and describe the various models available in the API.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/models](https://platform.openai.com/docs/api-reference/models)",
                       "tags": [
                          "v1"
-                      ]
+                      ],
+                      "responses": {"default": {"description": ""}}
                    }
                 },
                 "/v1/audio/transcriptions": {
@@ -1271,7 +1535,8 @@
                       "description": "Transcribes a wav file with speech to text using loaded Whisper model.\n\n This is an OpenAI compatibility endpoint.\n\n Please refer to OpenAI documentation at [https://platform.openai.com/docs/api-reference/audio/createTranscription](https://platform.openai.com/docs/api-reference/audio/createTranscription)",
                       "tags": [
                          "v1"
-                      ]
+                      ],
+                      "responses": {"default": {"description": ""}}
                    }
                 },
              },
@@ -1288,6 +1553,10 @@
                 {
                    "description": "Extended API unique to KoboldCpp",
                    "name": "api/extra"
+                },
+                {
+                   "description": "Common identity API for LLM services",
+                   "name": "serviceinfo"
                 },
                 {
                    "description": "Image Generation API (A1111 compatible)",
